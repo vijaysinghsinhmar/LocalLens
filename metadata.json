@@ -1,0 +1,5 @@
+{
+  "name": "X-Search Pro",
+  "description": "High-performance local transaction search tool for Excel, CSV, and TXT files. Operates 100% in-browser with zero data uploads.",
+  "requestFramePermissions": []
+}
