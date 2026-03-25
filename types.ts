@@ -1,4 +1,3 @@
-
 export interface SearchResult {
   id: string;
   fileId: string;
@@ -6,18 +5,18 @@ export interface SearchResult {
   filePath: string;
   sheetName?: string;
   rowNumber: number;
-  searchString: string; // Limited preview for the list
+  searchString: string;
+  score?: number;
 }
 
-export interface RecentSearch {
-  query: string;
-  timestamp: number;
-  exactMatch: boolean;
-  selectedFileTypes: string[];
-  filterMode: 'include' | 'exclude';
+export interface FileMetadata {
+  id: string;
+  name: string;
+  path: string;
+  type: string;
+  blob: File;
+  size: number;
 }
 
-export interface SortConfig {
-  key: string;
-  direction: 'asc' | 'desc';
-}
+export type SortKey = 'relevance' | 'fileName' | 'rowNumber';
+export type SortDir = 'asc' | 'desc';
