@@ -12,11 +12,11 @@ import { SearchResult, FileMetadata, SortKey, SortDir } from './types';
 import { workerScript } from './worker';
 
 // ── Constants ────────────────────────────────────────────────────────────────
-const MAX_WORKERS   = Math.min(navigator.hardwareConcurrency || 4, 8);
+const MAX_WORKERS   = Math.min(navigator.hardwareConcurrency || 4, 16);
 const ROW_HEIGHT    = 72;
 const BUFFER_ROWS   = 10;
-const DEBOUNCE_MS   = 250;
-const FLUSH_MS      = 100;
+const DEBOUNCE_MS   = 150;
+const FLUSH_MS      = 80;
 const SUPPORTED_EXT = ['xlsx', 'xls', 'csv', 'txt'] as const;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -175,7 +175,6 @@ const App: React.FC = () => {
           }
         } else if (action === 'ROW_DETAIL_RESULT') {
           setExpandedData(payload.rowData);
-          setLoadingDetail(false);
         } else if (action === 'EXPORT_READY') {
           const a = document.createElement('a');
           a.href = URL.createObjectURL(payload.blob);
@@ -242,7 +241,7 @@ const App: React.FC = () => {
     }
     setExpandedId(res.id);
     setExpandedData(null);
-    setLoadingDetail(true);
+    // No loadingDetail spinner needed — worker answers from parsed cache synchronously
     workers.current[0].postMessage({
       action: 'FETCH_ROW_DETAIL',
       payload: { fileId: res.fileId, rowNumber: res.rowNumber, sheetName: res.sheetName }

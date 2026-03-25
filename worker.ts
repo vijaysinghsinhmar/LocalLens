@@ -2,143 +2,216 @@ export const workerScript = `
   self.importScripts('https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js');
   self.importScripts('https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js');
 
-  const CHUNK_SIZE = 300;
-  const PRIORITY_KEYS = ['date','amount','nature','debit','credit','balance','name','particulars','ref','account','description','memo','payee','vendor','customer','invoice','total','qty','price'];
+  // ── Tuning constants ──────────────────────────────────────────────────────
+  const CHUNK_SIZE   = 500;   // flush to main thread every N matches
+  const YIELD_EVERY  = 5000;  // yield to event loop every N rows (keeps worker responsive)
 
-  // Per-worker caches
-  let fileCache = new Map();   // fileId -> { blob, type, name }
-  let matchCache = new Map();  // fileId -> Set<rowIndex>
+  // Priority key set — O(1) lookup instead of O(N) .some() per cell
+  const PRIORITY_SET = new Set([
+    'date','amount','nature','debit','credit','balance','name','particulars',
+    'ref','account','description','memo','payee','vendor','customer',
+    'invoice','total','qty','price','narration','remarks','note'
+  ]);
+
+  let fileCache  = new Map();   // fileId -> { blob, type, name }
+  let matchCache = new Map();   // fileId -> Set<rowIndex>
+  // Parsed data cache: avoids re-parsing the same file for row-detail / export
+  let parsedCache = new Map();  // fileId -> { headers: string[], rows: string[][] }
 
   self.onmessage = async function(e) {
     const { action, payload } = e.data;
-    if (action === 'PROCESS_FILE')    await processFile(payload);
-    else if (action === 'FETCH_ROW_DETAIL') await fetchRowDetail(payload);
-    else if (action === 'GENERATE_EXPORT')  await generateExport(payload);
-    else if (action === 'CLEAR_CACHE') { fileCache.clear(); matchCache.clear(); }
+    if      (action === 'PROCESS_FILE')    await processFile(payload);
+    else if (action === 'FETCH_ROW_DETAIL') fetchRowDetail(payload);
+    else if (action === 'GENERATE_EXPORT')  await generateExport();
+    else if (action === 'CLEAR_CACHE')     { fileCache.clear(); matchCache.clear(); parsedCache.clear(); }
   };
 
-  // ── Fuzzy: all terms must appear ─────────────────────────────────────────
-  function matchesFuzzy(queryTerms, str) {
-    for (const t of queryTerms) if (!str.includes(t)) return false;
-    return true;
-  }
+  // ── Parse any file into { headers, rows } where every cell is a string ────
+  // This is the hot path — optimised to avoid all unnecessary allocations.
+  async function parseToStringRows(fileId, blob, type) {
+    if (parsedCache.has(fileId)) return parsedCache.get(fileId);
 
-  // ── Relevance score (higher = better) ────────────────────────────────────
-  function score(queryTerms, str) {
-    let s = 0;
-    for (const t of queryTerms) {
-      const idx = str.indexOf(t);
-      if (idx === -1) return 0;
-      if (idx === 0) s += 3;
-      else s += 1;
-    }
-    return s;
-  }
+    let result = { headers: [], rows: [] };
 
-  // ── Row detail fetch ──────────────────────────────────────────────────────
-  async function fetchRowDetail({ fileId, rowNumber, sheetName }) {
-    const file = fileCache.get(fileId);
-    if (!file) { self.postMessage({ action: 'ROW_DETAIL_RESULT', payload: { fileId, rowNumber, rowData: null } }); return; }
-    try {
-      let rowData = null;
-      if (file.type === 'xlsx' || file.type === 'xls') {
-        const buf = await file.blob.arrayBuffer();
-        const wb  = XLSX.read(buf, { type: 'array', dense: true });
-        const ws  = wb.Sheets[sheetName || wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
-        rowData = rows[rowNumber - 2] || null;
-      } else if (file.type === 'csv') {
-        const text = await file.blob.text();
-        const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
-        rowData = parsed.data[rowNumber - 2] || null;
-      } else {
-        const text = await file.blob.text();
-        const lines = text.split(/\r?\n/);
-        rowData = { line: lines[rowNumber - 2] || '' };
+    if (type === 'xlsx' || type === 'xls') {
+      const buf = await blob.arrayBuffer();
+      // raw:true = no date parsing, no number formatting — just raw values
+      // dense:true = array-of-arrays layout, much faster than object layout
+      const wb  = XLSX.read(buf, { type: 'array', raw: true, dense: true });
+
+      const allHeaders = [];
+      const allRows    = [];
+
+      for (const sName of wb.SheetNames) {
+        const ws = wb.Sheets[sName];
+        if (!ws || !ws['!data']) continue;
+        const data = ws['!data']; // array of arrays (dense mode)
+        if (data.length === 0) continue;
+
+        // First row = headers
+        const headerRow = data[0];
+        const headers   = headerRow.map(c => (c ? String(c.v ?? '') : ''));
+
+        // Build a combined header prefix for this sheet: "sheetname::colname"
+        // so multi-sheet xlsx keeps columns distinguishable
+        const prefixed = wb.SheetNames.length > 1
+          ? headers.map(h => sName + '::' + h)
+          : headers;
+
+        allHeaders.push(...prefixed);
+
+        for (let r = 1; r < data.length; r++) {
+          const srcRow  = data[r] || [];
+          const strRow  = new Array(headers.length);
+          for (let c = 0; c < headers.length; c++) {
+            const cell = srcRow[c];
+            strRow[c]  = cell ? String(cell.v ?? '') : '';
+          }
+          // Attach sheet name as last "column" for display
+          strRow._sheet = sName;
+          allRows.push(strRow);
+        }
       }
-      self.postMessage({ action: 'ROW_DETAIL_RESULT', payload: { fileId, rowNumber, rowData } });
-    } catch(err) {
-      self.postMessage({ action: 'ROW_DETAIL_RESULT', payload: { fileId, rowNumber, rowData: null } });
+
+      result = { headers: allHeaders, rows: allRows };
+
+    } else if (type === 'csv') {
+      const text = await blob.text();
+      // Worker-local parse — step mode to avoid holding entire parsed structure
+      const headers = [];
+      const rows    = [];
+      let   first   = true;
+      Papa.parse(text, {
+        skipEmptyLines: true,
+        step: ({ data }) => {
+          if (first) { headers.push(...data); first = false; return; }
+          rows.push(data.map(v => String(v ?? '')));
+        }
+      });
+      result = { headers, rows };
+
+    } else {
+      // Plain text: one "column" called "line"
+      const text  = await blob.text();
+      const lines = text.split(/\\r?\\n/);
+      result = {
+        headers: ['line'],
+        rows: lines.filter(l => l.trim()).map(l => [l.trim()])
+      };
     }
+
+    parsedCache.set(fileId, result);
+    return result;
   }
 
-  // ── Main file processor ───────────────────────────────────────────────────
+  // ── Main search ───────────────────────────────────────────────────────────
   async function processFile({ fileId, blob, type, name, path, query, exactMatch, fuzzy }) {
     fileCache.set(fileId, { blob, type, name });
+
     const matchedRows = new Set();
+    let pending       = [];
+    let totalRows     = 0;
+
+    const flush = () => {
+      if (pending.length) {
+        self.postMessage({ action: 'MATCH_CHUNK', payload: { fileId, matches: pending } });
+        pending = [];
+      }
+    };
 
     try {
-      const lq = query.toLowerCase().trim();
-      const terms = lq.split(/\s+/).filter(t => t.length > 0);
+      const lq    = query.toLowerCase().trim();
+      const terms = lq.split(/\\s+/).filter(t => t.length > 0);
       const empty = terms.length === 0;
-      let pending = [];
-      let totalRows = 0;
 
-      const flush = () => {
-        if (pending.length) {
-          self.postMessage({ action: 'MATCH_CHUNK', payload: { fileId, matches: pending } });
-          pending = [];
+      const { headers, rows } = await parseToStringRows(fileId, blob, type);
+
+      // Pre-compute which header indices are "priority" for preview
+      // Do this ONCE per file, not per row
+      const priorityIdx = [];
+      for (let i = 0; i < headers.length; i++) {
+        const h = headers[i].toLowerCase();
+        // strip sheet prefix if present
+        const bare = h.includes('::') ? h.split('::')[1] : h;
+        for (const pk of PRIORITY_SET) {
+          if (bare.includes(pk)) { priorityIdx.push(i); break; }
         }
-      };
+        if (priorityIdx.length >= 4) break;
+      }
+      // Fallback: first 3 columns
+      const previewIdx = priorityIdx.length ? priorityIdx : [0, 1, 2].filter(i => i < headers.length);
 
-      const onRow = (row, sName) => {
+      // ── Hot loop ─────────────────────────────────────────────────────────
+      for (let ri = 0; ri < rows.length; ri++) {
+        // Yield to event loop periodically so worker stays responsive
+        if ((ri & 4999) === 4999) await new Promise(r => setTimeout(r, 0));
+
         totalRows++;
-        const vals = Object.values(row).map(v => String(v));
-        const full  = vals.map(v => v.toLowerCase()).join(' ');
-        const previews = [];
-        for (const [k, v] of Object.entries(row)) {
-          if (previews.length >= 4) break;
-          if (PRIORITY_KEYS.some(pk => k.toLowerCase().includes(pk))) previews.push(k + ': ' + v);
-        }
-        if (!previews.length) previews.push(...vals.slice(0, 3));
+        const row = rows[ri];
 
-        let isMatch = empty;
+        // Build single concatenated search string — ONE allocation per row
+        // Use a separator unlikely to appear in data
+        let searchStr = '';
+        for (let ci = 0; ci < row.length; ci++) {
+          if (row[ci]) searchStr += row[ci] + '|';
+        }
+        const lowerStr = searchStr.toLowerCase();
+
+        // ── Match check ───────────────────────────────────────────────────
+        let isMatch  = empty;
         let rowScore = 0;
+
         if (!isMatch) {
           if (exactMatch) {
-            isMatch = vals.some(v => v.toLowerCase() === lq);
-            rowScore = isMatch ? 10 : 0;
+            // Exact: any single cell equals query exactly
+            for (let ci = 0; ci < row.length; ci++) {
+              if (row[ci].toLowerCase() === lq) { isMatch = true; rowScore = 10; break; }
+            }
           } else if (fuzzy) {
-            rowScore = score(terms, full);
-            isMatch  = rowScore > 0;
+            // Fuzzy: ALL terms must appear somewhere in the row
+            let allFound = true;
+            let s = 0;
+            for (let ti = 0; ti < terms.length; ti++) {
+              const idx = lowerStr.indexOf(terms[ti]);
+              if (idx === -1) { allFound = false; break; }
+              s += idx === 0 ? 3 : 1;
+            }
+            if (allFound) { isMatch = true; rowScore = s; }
           } else {
-            isMatch  = full.includes(lq);
-            rowScore = isMatch ? full.indexOf(lq) === 0 ? 3 : 1 : 0;
+            // Substring: query appears anywhere in the row
+            const idx = lowerStr.indexOf(lq);
+            if (idx !== -1) { isMatch = true; rowScore = idx === 0 ? 3 : 1; }
           }
         }
 
-        if (isMatch) {
-          matchedRows.add(totalRows);
-          pending.push({
-            id: fileId + '-' + totalRows,
-            fileId,
-            fileName: name,
-            filePath: path,
-            sheetName: sName || null,
-            rowNumber: totalRows + 1,
-            searchString: previews.join(' • '),
-            score: rowScore
-          });
-          if (pending.length >= CHUNK_SIZE) flush();
-        }
-      };
+        if (!isMatch) continue;
 
-      if (type === 'xlsx' || type === 'xls') {
-        const buf = await blob.arrayBuffer();
-        const wb  = XLSX.read(buf, { type: 'array', dense: true, cellDates: true });
-        for (const sName of wb.SheetNames) {
-          const ws   = wb.Sheets[sName];
-          const data = XLSX.utils.sheet_to_json(ws, { defval: '' });
-          for (const row of data) onRow(row, sName);
+        matchedRows.add(ri);
+
+        // Build preview — only for matched rows, using pre-computed indices
+        const parts = [];
+        for (let pi = 0; pi < previewIdx.length; pi++) {
+          const ci  = previewIdx[pi];
+          const val = row[ci];
+          if (val) {
+            const hdr = headers[ci];
+            const bare = hdr.includes('::') ? hdr.split('::')[1] : hdr;
+            parts.push(bare + ': ' + val);
+          }
         }
-      } else if (type === 'csv') {
-        const text = await blob.text();
-        Papa.parse(text, { header: true, skipEmptyLines: true, step: r => onRow(r.data, null) });
-      } else {
-        const text = await blob.text();
-        for (const line of text.split(/\r?\n/)) {
-          if (line.trim()) onRow({ line: line.trim() }, null);
-        }
+
+        pending.push({
+          id:           fileId + '-' + ri,
+          fileId,
+          fileName:     name,
+          filePath:     path,
+          sheetName:    row._sheet || null,
+          rowNumber:    ri + 2,   // 1-based + header offset
+          searchString: parts.length ? parts.join(' • ') : (row[0] || '').slice(0, 120),
+          score:        rowScore
+        });
+
+        if (pending.length >= CHUNK_SIZE) flush();
       }
 
       flush();
@@ -149,46 +222,63 @@ export const workerScript = `
     }
   }
 
-  // ── Export all matched rows as CSV ────────────────────────────────────────
+  // ── Row detail — uses parsed cache, no re-parse ───────────────────────────
+  function fetchRowDetail({ fileId, rowNumber, sheetName }) {
+    const parsed = parsedCache.get(fileId);
+    if (!parsed) {
+      self.postMessage({ action: 'ROW_DETAIL_RESULT', payload: { fileId, rowNumber, rowData: null } });
+      return;
+    }
+    const { headers, rows } = parsed;
+    const row = rows[rowNumber - 2]; // rowNumber is 1-based + header offset
+    if (!row) {
+      self.postMessage({ action: 'ROW_DETAIL_RESULT', payload: { fileId, rowNumber, rowData: null } });
+      return;
+    }
+    const obj = {};
+    for (let i = 0; i < headers.length; i++) {
+      const hdr  = headers[i];
+      const bare = hdr.includes('::') ? hdr.split('::')[1] : hdr;
+      obj[bare]  = row[i] || '';
+    }
+    self.postMessage({ action: 'ROW_DETAIL_RESULT', payload: { fileId, rowNumber, rowData: obj } });
+  }
+
+  // ── Export — uses parsed cache ────────────────────────────────────────────
   async function generateExport() {
-    const headers = new Set(['FileName', 'Sheet', 'RowNumber']);
-    const rows    = [];
+    const csvParts = [];
+    let headerWritten = false;
+    let globalHeaders = [];
 
     for (const [fileId, matched] of matchCache.entries()) {
       if (!matched.size) continue;
-      const file = fileCache.get(fileId);
-      if (!file) continue;
+      const file   = fileCache.get(fileId);
+      const parsed = parsedCache.get(fileId);
+      if (!file || !parsed) continue;
 
-      if (file.type === 'xlsx' || file.type === 'xls') {
-        const buf = await file.blob.arrayBuffer();
-        const wb  = XLSX.read(buf, { type: 'array', dense: true });
-        for (const sName of wb.SheetNames) {
-          const data = XLSX.utils.sheet_to_json(wb.Sheets[sName], { defval: '' });
-          data.forEach((r, i) => {
-            if (!matched.has(i + 1)) return;
-            const out = { FileName: file.name, Sheet: sName, RowNumber: i + 2, ...r };
-            Object.keys(out).forEach(k => headers.add(k));
-            rows.push(out);
-          });
-        }
-      } else if (file.type === 'csv') {
-        const text = await file.blob.text();
-        const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
-        parsed.data.forEach((r, i) => {
-          if (!matched.has(i + 1)) return;
-          const out = { FileName: file.name, Sheet: 'N/A', RowNumber: i + 2, ...r };
-          Object.keys(out).forEach(k => headers.add(k));
-          rows.push(out);
-        });
+      const { headers, rows } = parsed;
+
+      if (!headerWritten) {
+        globalHeaders = ['FileName', 'Sheet', 'RowNumber', ...headers.map(h => h.includes('::') ? h.split('::')[1] : h)];
+        csvParts.push(globalHeaders.map(h => '"' + h.replace(/"/g, '""') + '"').join(','));
+        headerWritten = true;
+      }
+
+      for (const ri of matched) {
+        const row = rows[ri];
+        if (!row) continue;
+        const cells = [
+          '"' + file.name.replace(/"/g, '""') + '"',
+          '"' + (row._sheet || 'N/A') + '"',
+          ri + 2,
+          ...row.map(v => '"' + String(v ?? '').replace(/"/g, '""') + '"')
+        ];
+        csvParts.push(cells.join(','));
       }
     }
 
-    const hArr = Array.from(headers);
-    const csv  = [
-      hArr.join(','),
-      ...rows.map(r => hArr.map(h => '"' + String(r[h] ?? '').replace(/"/g, '""') + '"').join(','))
-    ].join('\n');
-
-    self.postMessage({ action: 'EXPORT_READY', payload: { blob: new Blob([csv], { type: 'text/csv' }) } });
+    const csv  = csvParts.join('\\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    self.postMessage({ action: 'EXPORT_READY', payload: { blob } });
   }
 `;
