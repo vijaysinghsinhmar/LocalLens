@@ -1,263 +1,287 @@
+// Worker runs in its own scope — no React, no modules
+// Blob URL created in App.tsx and passed to new Worker(url)
+
 export const workerScript = `
-  self.importScripts('https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js');
-  self.importScripts('https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js');
+(function() {
+  'use strict';
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  //  ARCHITECTURE: Parse-once, search-many flat string index
-  //
-  //  On first load of a file we build TWO things and keep them forever:
-  //    1. flatLines[]  — one string per row: "cell1|cell2|cell3"  (lowercase)
-  //    2. rawRows[]    — original string[][] for display / export
-  //
-  //  On every search we do plain indexOf on flatLines[] — no re-parsing,
-  //  no arrayBuffer(), no PapaParse, no XLSX.read().
-  //
-  //  Memory: ~2–4 bytes per character. A 315MB XLSX with text data compresses
-  //  to roughly the same after string conversion. We accept this trade-off
-  //  because the alternative (re-parsing on every search) makes the app unusable.
-  //
-  //  Workers = 2 (never more). Two workers parse two files in parallel.
-  //  More workers = more simultaneous arrayBuffer() calls = OOM.
-  // ═══════════════════════════════════════════════════════════════════════════
+  self.importScripts(
+    'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js'
+  );
 
-  const CHUNK   = 300;   // batch size before postMessage
+  // fileId -> { flat: string[], rows: string[][], headers: string[], sheets: (string|null)[], name: string }
+  var DB = {};
 
-  const PRIO = new Set([
-    'date','amount','nature','debit','credit','balance','name','particulars',
-    'ref','account','description','memo','payee','vendor','customer',
-    'invoice','total','qty','price','narration','remarks','note','utr','trn','tran'
-  ]);
-
-  // Per-worker persistent index — survives across searches
-  // fileId -> { flatLines: string[], rawRows: string[][], headers: string[], sheets: string[] }
-  const INDEX = new Map();
-
-  self.onmessage = async function(e) {
-    const { action, payload } = e.data;
-    if      (action === 'INDEX_FILE')      await indexFile(payload);
-    else if (action === 'SEARCH_FILE')     searchFile(payload);
-    else if (action === 'FETCH_ROW')       fetchRow(payload);
-    else if (action === 'EXPORT_MATCHES')  exportMatches(payload);
-    else if (action === 'DROP_INDEX')      INDEX.delete(payload.fileId);
-    else if (action === 'CLEAR_ALL')       INDEX.clear();
+  self.onmessage = function(ev) {
+    var msg = ev.data;
+    if      (msg.type === 'index')  doIndex(msg);
+    else if (msg.type === 'search') doSearch(msg);
+    else if (msg.type === 'row')    doRow(msg);
+    else if (msg.type === 'export') doExport(msg);
+    else if (msg.type === 'clear')  DB = {};
   };
 
-  // ── PHASE 1: Index a file (done once per file load) ──────────────────────
-  async function indexFile({ fileId, blob, type, name }) {
+  // ── INDEX ─────────────────────────────────────────────────────────────────
+  function doIndex(msg) {
+    var id   = msg.id;
+    var blob = msg.blob;
+    var type = msg.ftype;
+    var name = msg.name;
+
+    var flat    = [];
+    var rows    = [];
+    var sheets  = [];
+    var headers = [];
+
     try {
-      const flatLines = [];  // lowercase concatenated row strings for search
-      const rawRows   = [];  // original cells for display
-      const sheets    = [];  // sheet name per row
-      let   headers   = [];
-
       if (type === 'xlsx' || type === 'xls') {
-        const buf = await blob.arrayBuffer();
-        const wb  = XLSX.read(buf, { type:'array', raw:true, dense:true, sheetStubs:false });
-        const multi = wb.SheetNames.length > 1;
+        var buf = new Uint8Array(blobToArrayBufferSync(blob));
+        var wb  = XLSX.read(buf, { type: 'array', raw: true, dense: true });
+        var multi = wb.SheetNames.length > 1;
 
-        for (const sName of wb.SheetNames) {
-          const ws = wb.Sheets[sName];
+        for (var si = 0; si < wb.SheetNames.length; si++) {
+          var sName = wb.SheetNames[si];
+          var ws    = wb.Sheets[sName];
           if (!ws || !ws['!data'] || ws['!data'].length < 2) continue;
-          const data   = ws['!data'];
-          const hdrRow = data[0] || [];
-          const hdrs   = hdrRow.map(c => c ? String(c.v ?? '') : '');
 
-          // Only set headers from first sheet
-          if (!headers.length) {
-            headers = multi ? hdrs.map(h => sName+'::'+h) : hdrs;
+          var data   = ws['!data'];
+          var hdrRow = data[0] || [];
+          var hdrs   = [];
+          for (var hi = 0; hi < hdrRow.length; hi++) {
+            hdrs.push(hdrRow[hi] ? String(hdrRow[hi].v || '') : '');
           }
 
-          for (let r = 1; r < data.length; r++) {
-            const src   = data[r] || [];
-            const cells = new Array(hdrs.length);
-            let   flat  = '';
-            for (let c = 0; c < hdrs.length; c++) {
-              const v  = src[c] ? String(src[c].v ?? '') : '';
-              cells[c] = v;
-              if (v) { flat += v; flat += '|'; }
+          if (!headers.length) {
+            headers = multi ? hdrs.map(function(h){ return sName+'::'+h; }) : hdrs.slice();
+          }
+
+          for (var r = 1; r < data.length; r++) {
+            var src   = data[r] || [];
+            var cells = [];
+            var f     = '';
+            for (var c = 0; c < hdrs.length; c++) {
+              var v = src[c] ? String(src[c].v || '') : '';
+              cells.push(v);
+              if (v) { f += v; f += '|'; }
             }
-            flatLines.push(flat.toLowerCase());
-            rawRows.push(cells);
+            flat.push(f.toLowerCase());
+            rows.push(cells);
             sheets.push(sName);
           }
         }
 
       } else if (type === 'csv') {
-        const text  = await blob.text();
-        let   first = true;
+        var text  = blobToTextSync(blob);
+        var first = true;
         Papa.parse(text, {
           skipEmptyLines: true,
-          step: ({ data }) => {
-            if (first) { headers = data.map(v => String(v ?? '')); first = false; return; }
-            const cells = data.map(v => String(v ?? ''));
-            let flat = '';
-            for (let i = 0; i < cells.length; i++) {
-              if (cells[i]) { flat += cells[i]; flat += '|'; }
+          step: function(result) {
+            var data = result.data;
+            if (first) {
+              for (var i = 0; i < data.length; i++) headers.push(String(data[i] || ''));
+              first = false;
+              return;
             }
-            flatLines.push(flat.toLowerCase());
-            rawRows.push(cells);
+            var cells = [];
+            var f = '';
+            for (var i = 0; i < data.length; i++) {
+              var v = String(data[i] || '');
+              cells.push(v);
+              if (v) { f += v; f += '|'; }
+            }
+            flat.push(f.toLowerCase());
+            rows.push(cells);
             sheets.push(null);
           }
         });
 
       } else {
-        // TXT
+        // txt
         headers = ['line'];
-        const text  = await blob.text();
-        const lines = text.split(/\r?\n/);
-        for (const l of lines) {
-          const t = l.trim();
+        var text  = blobToTextSync(blob);
+        var lines = text.split(/\r?\n/);
+        for (var li = 0; li < lines.length; li++) {
+          var t = lines[li].trim();
           if (!t) continue;
-          flatLines.push(t.toLowerCase());
-          rawRows.push([t]);
+          flat.push(t.toLowerCase());
+          rows.push([t]);
           sheets.push(null);
         }
       }
 
-      INDEX.set(fileId, { flatLines, rawRows, headers, sheets, name });
-      self.postMessage({ action:'INDEX_DONE', payload:{ fileId, rowCount: flatLines.length } });
-    } catch(err) {
-      self.postMessage({ action:'INDEX_ERROR', payload:{ fileId, error: err.message } });
+      DB[id] = { flat: flat, rows: rows, headers: headers, sheets: sheets, name: name };
+      self.postMessage({ type: 'indexed', id: id, count: flat.length });
+
+    } catch(e) {
+      self.postMessage({ type: 'indexerr', id: id, err: String(e && e.message || e) });
     }
   }
 
-  // ── PHASE 2: Search (pure JS, no I/O, no parsing) ────────────────────────
-  function searchFile({ fileId, query, exactMatch, fuzzy, searchId }) {
-    const idx = INDEX.get(fileId);
-    if (!idx) {
-      self.postMessage({ action:'SEARCH_ERROR', payload:{ fileId, searchId, error:'Not indexed' } });
+  // ── SEARCH ────────────────────────────────────────────────────────────────
+  function doSearch(msg) {
+    var sid   = msg.sid;
+    var id    = msg.id;
+    var q     = (msg.query || '').toLowerCase().trim();
+    var exact = msg.exact;
+    var fuzzy = msg.fuzzy;
+    var entry = DB[id];
+
+    if (!entry) {
+      self.postMessage({ type: 'searchdone', sid: sid, id: id });
       return;
     }
 
-    const { flatLines, rawRows, headers, sheets, name } = idx;
-    const lq    = query.toLowerCase().trim();
-    const terms = lq.split(/\s+/).filter(t => t.length > 0);
-    const empty = !lq;
+    var flat  = entry.flat;
+    var rows  = entry.rows;
+    var hdrs  = entry.headers;
+    var shts  = entry.sheets;
+    var name  = entry.name;
 
-    // Pre-compute priority preview column indices once
-    const previewIdx = [];
-    for (let i = 0; i < headers.length && previewIdx.length < 4; i++) {
-      const bare = headers[i].toLowerCase().replace(/^[^:]+::/, '');
-      for (const pk of PRIO) { if (bare.includes(pk)) { previewIdx.push(i); break; } }
+    // Priority columns for preview
+    var PRIO  = ['date','amount','nature','debit','credit','balance','name',
+                 'particulars','ref','account','description','narration','utr'];
+    var prvIdx = [];
+    for (var hi = 0; hi < hdrs.length && prvIdx.length < 4; hi++) {
+      var bare = hdrs[hi].toLowerCase().replace(/^[^:]+::/, '');
+      for (var pi = 0; pi < PRIO.length; pi++) {
+        if (bare.indexOf(PRIO[pi]) !== -1) { prvIdx.push(hi); break; }
+      }
     }
-    if (!previewIdx.length) {
-      for (let i = 0; i < Math.min(3, headers.length); i++) previewIdx.push(i);
+    if (!prvIdx.length) {
+      for (var i = 0; i < Math.min(3, hdrs.length); i++) prvIdx.push(i);
     }
 
-    const matches = [];
+    var terms   = q ? q.split(/\s+/).filter(function(t){ return t.length > 0; }) : [];
+    var empty   = !q;
+    var matches = [];
+    var CHUNK   = 250;
 
-    for (let ri = 0; ri < flatLines.length; ri++) {
-      const flat = flatLines[ri];
-      let score  = 0;
+    for (var ri = 0; ri < flat.length; ri++) {
+      var f     = flat[ri];
+      var score = 0;
 
       if (empty) {
         score = 1;
-      } else if (exactMatch) {
-        // Exact: check each raw cell
-        const cells = rawRows[ri];
-        for (let ci = 0; ci < cells.length; ci++) {
-          if (cells[ci].toLowerCase() === lq) { score = 10; break; }
+      } else if (exact) {
+        var cr = rows[ri];
+        for (var ci = 0; ci < cr.length; ci++) {
+          if (cr[ci].toLowerCase() === q) { score = 10; break; }
         }
       } else if (fuzzy) {
-        // All terms must appear
-        let s = 0, ok = true;
-        for (let t = 0; t < terms.length; t++) {
-          const pos = flat.indexOf(terms[t]);
+        var ok = true; var s = 0;
+        for (var ti = 0; ti < terms.length; ti++) {
+          var pos = f.indexOf(terms[ti]);
           if (pos === -1) { ok = false; break; }
           s += pos === 0 ? 3 : 1;
         }
-        if (ok) score = s;
+        if (ok) score = s || 1;
       } else {
-        // Substring
-        const pos = flat.indexOf(lq);
-        if (pos !== -1) score = pos === 0 ? 3 : 1;
+        var pos2 = f.indexOf(q);
+        if (pos2 !== -1) score = pos2 === 0 ? 3 : 1;
       }
 
       if (!score) continue;
 
-      // Build preview from raw cells
-      const cells = rawRows[ri];
-      const parts = [];
-      for (let pi = 0; pi < previewIdx.length; pi++) {
-        const v = cells[previewIdx[pi]];
-        if (v) {
-          const h = headers[previewIdx[pi]].replace(/^[^:]+::/, '');
-          parts.push(h + ': ' + v);
+      var cells = rows[ri];
+      var parts = [];
+      for (var pj = 0; pj < prvIdx.length; pj++) {
+        var cv = cells[prvIdx[pj]];
+        if (cv) {
+          var ch = hdrs[prvIdx[pj]].replace(/^[^:]+::/, '');
+          parts.push(ch + ': ' + cv);
         }
       }
 
       matches.push({
-        id:           fileId + '-' + ri,
-        fileId,
-        fileName:     name,
-        sheetName:    sheets[ri],
-        rowNumber:    ri + 2,
-        searchString: parts.length ? parts.join(' • ') : (cells[0] || '').slice(0, 100),
-        score,
-        _ri: ri   // keep for row detail lookup
+        id:  id + '-' + ri,
+        fid: id,
+        fn:  name,
+        sn:  shts[ri],
+        rn:  ri + 2,
+        ss:  parts.length ? parts.join(' • ') : (cells[0] || '').slice(0, 100),
+        sc:  score,
+        ri:  ri
       });
 
       if (matches.length >= CHUNK) {
-        self.postMessage({ action:'SEARCH_CHUNK', payload:{ fileId, searchId, matches: matches.splice(0) } });
+        self.postMessage({ type: 'results', sid: sid, hits: matches.slice() });
+        matches.length = 0;
       }
     }
 
     if (matches.length) {
-      self.postMessage({ action:'SEARCH_CHUNK', payload:{ fileId, searchId, matches } });
+      self.postMessage({ type: 'results', sid: sid, hits: matches });
     }
-    self.postMessage({ action:'SEARCH_DONE', payload:{ fileId, searchId } });
+    self.postMessage({ type: 'searchdone', sid: sid, id: id });
   }
 
-  // ── Row detail — O(1) from index ──────────────────────────────────────────
-  function fetchRow({ fileId, ri }) {
-    const idx = INDEX.get(fileId);
-    if (!idx || !idx.rawRows[ri]) {
-      self.postMessage({ action:'ROW_DATA', payload:{ fileId, ri, data: null } });
+  // ── ROW DETAIL ────────────────────────────────────────────────────────────
+  function doRow(msg) {
+    var entry = DB[msg.id];
+    if (!entry || !entry.rows[msg.ri]) {
+      self.postMessage({ type: 'rowdata', id: msg.id, ri: msg.ri, data: null });
       return;
     }
-    const cells = idx.rawRows[ri];
-    const obj   = {};
-    for (let i = 0; i < idx.headers.length; i++) {
-      obj[idx.headers[i].replace(/^[^:]+::/, '')] = cells[i] || '';
+    var cells = entry.rows[msg.ri];
+    var hdrs  = entry.headers;
+    var obj   = {};
+    for (var i = 0; i < hdrs.length; i++) {
+      obj[hdrs[i].replace(/^[^:]+::/, '') || ('col'+i)] = cells[i] || '';
     }
-    self.postMessage({ action:'ROW_DATA', payload:{ fileId, ri, data: obj } });
+    self.postMessage({ type: 'rowdata', id: msg.id, ri: msg.ri, data: obj });
   }
 
-  // ── Export matched rows ───────────────────────────────────────────────────
-  function exportMatches({ matches }) {
-    if (!matches.length) {
-      self.postMessage({ action:'EXPORT_READY', payload:{ blob: new Blob([''], { type:'text/csv' }) } });
+  // ── EXPORT ────────────────────────────────────────────────────────────────
+  function doExport(msg) {
+    var hits = msg.hits || [];
+    if (!hits.length) {
+      self.postMessage({ type: 'exportready', blob: new Blob([''], { type: 'text/csv' }) });
       return;
     }
-    const lines = [];
-    // Group by fileId to get headers
-    const byFile = new Map();
-    for (const m of matches) {
-      if (!byFile.has(m.fileId)) byFile.set(m.fileId, []);
-      byFile.get(m.fileId).push(m);
+    var lines = [];
+    var byFile = {};
+    for (var i = 0; i < hits.length; i++) {
+      var h = hits[i];
+      if (!byFile[h.fid]) byFile[h.fid] = [];
+      byFile[h.fid].push(h);
     }
-
-    let wroteHeader = false;
-    for (const [fileId, ms] of byFile) {
-      const idx = INDEX.get(fileId);
-      if (!idx) continue;
-      const bareHdrs = idx.headers.map(h => h.replace(/^[^:]+::/, ''));
-      if (!wroteHeader) {
-        lines.push(['FileName','Sheet','RowNumber',...bareHdrs]
-          .map(h => '"'+h.replace(/"/g,'""')+'"').join(','));
-        wroteHeader = true;
+    var wroteHdr = false;
+    for (var fid in byFile) {
+      var entry = DB[fid];
+      if (!entry) continue;
+      var bh = entry.headers.map(function(h){ return h.replace(/^[^:]+::/, ''); });
+      if (!wroteHdr) {
+        lines.push(['FileName','Sheet','Row'].concat(bh)
+          .map(function(x){ return '"'+String(x).replace(/"/g,'""')+'"'; }).join(','));
+        wroteHdr = true;
       }
-      for (const m of ms) {
-        const cells = idx.rawRows[m._ri] || [];
+      var fhits = byFile[fid];
+      for (var j = 0; j < fhits.length; j++) {
+        var m  = fhits[j];
+        var cr = entry.rows[m.ri] || [];
         lines.push([
-          '"'+idx.name.replace(/"/g,'""')+'"',
-          '"'+(m.sheetName||'N/A')+'"',
-          m.rowNumber,
-          ...cells.map(v => '"'+String(v).replace(/"/g,'""')+'"')
-        ].join(','));
+          '"'+entry.name.replace(/"/g,'""')+'"',
+          '"'+(m.sn||'N/A')+'"',
+          m.rn
+        ].concat(cr.map(function(v){ return '"'+String(v).replace(/"/g,'""')+'"'; })).join(','));
       }
     }
-    self.postMessage({ action:'EXPORT_READY',
-      payload:{ blob: new Blob([lines.join('\n')], { type:'text/csv' }) } });
+    self.postMessage({ type: 'exportready',
+      blob: new Blob([lines.join('\n')], { type: 'text/csv' }) });
   }
+
+  // ── Sync helpers (workers can use synchronous XHR on blob URLs) ───────────
+  function blobToArrayBufferSync(blob) {
+    // FileReaderSync is available in workers
+    var fr = new FileReaderSync();
+    return fr.readAsArrayBuffer(blob);
+  }
+
+  function blobToTextSync(blob) {
+    var fr = new FileReaderSync();
+    return fr.readAsText(blob);
+  }
+
+})();
 `;
