@@ -8,12 +8,12 @@ import { SearchResult, FileMetadata, SortKey, SortDir } from './types';
 import { workerScript } from './worker';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const MAX_WORKERS    = Math.min(navigator.hardwareConcurrency || 4, 8); // 8 cap prevents OOM
+const MAX_WORKERS    = Math.min(navigator.hardwareConcurrency || 4, 4); // 8 cap prevents OOM
 const ROW_HEIGHT     = 64;
 const BUFFER_ROWS    = 8;
-const DEBOUNCE_MS    = 180;
+const DEBOUNCE_MS    = 300;
 const FLUSH_MS       = 60;
-const MAX_RESULTS_UI = 50_000; // cap UI list — beyond this, show count only
+const MAX_RESULTS_UI = 25_000; // cap UI list — beyond this, show count only
 const SUPPORTED_EXT  = ['xlsx', 'xls', 'csv', 'txt'] as const;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
