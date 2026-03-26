@@ -2,317 +2,262 @@ export const workerScript = `
   self.importScripts('https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js');
   self.importScripts('https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js');
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Memory strategy: never cache full parsed rows.
-  // rowCache stores ONLY matched rows (tiny). No parsedCache.
-  // Workers cap at 4 to limit peak RAM.
-  // ─────────────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  ARCHITECTURE: Parse-once, search-many flat string index
+  //
+  //  On first load of a file we build TWO things and keep them forever:
+  //    1. flatLines[]  — one string per row: "cell1|cell2|cell3"  (lowercase)
+  //    2. rawRows[]    — original string[][] for display / export
+  //
+  //  On every search we do plain indexOf on flatLines[] — no re-parsing,
+  //  no arrayBuffer(), no PapaParse, no XLSX.read().
+  //
+  //  Memory: ~2–4 bytes per character. A 315MB XLSX with text data compresses
+  //  to roughly the same after string conversion. We accept this trade-off
+  //  because the alternative (re-parsing on every search) makes the app unusable.
+  //
+  //  Workers = 2 (never more). Two workers parse two files in parallel.
+  //  More workers = more simultaneous arrayBuffer() calls = OOM.
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  const CHUNK_SIZE = 200;
+  const CHUNK   = 300;   // batch size before postMessage
 
-  const PRIORITY_SET = new Set([
+  const PRIO = new Set([
     'date','amount','nature','debit','credit','balance','name','particulars',
     'ref','account','description','memo','payee','vendor','customer',
-    'invoice','total','qty','price','narration','remarks','note','utr','trn'
+    'invoice','total','qty','price','narration','remarks','note','utr','trn','tran'
   ]);
 
-  let fileCache  = new Map();  // fileId -> { blob, type, name, path }
-  let matchCache = new Map();  // fileId -> Set<rowIdx>
-  let rowCache   = new Map();  // fileId -> Map<rowIdx, cells[]>  (matched rows ONLY)
-  let hdrCache   = new Map();  // fileId -> string[]
+  // Per-worker persistent index — survives across searches
+  // fileId -> { flatLines: string[], rawRows: string[][], headers: string[], sheets: string[] }
+  const INDEX = new Map();
 
   self.onmessage = async function(e) {
     const { action, payload } = e.data;
-    if      (action === 'PROCESS_FILE')     await processFile(payload);
-    else if (action === 'FETCH_ROW_DETAIL') fetchRowDetail(payload);
-    else if (action === 'GENERATE_EXPORT')  await generateExport();
-    else if (action === 'CLEAR_CACHE') {
-      fileCache.clear(); matchCache.clear(); rowCache.clear(); hdrCache.clear();
-    }
+    if      (action === 'INDEX_FILE')      await indexFile(payload);
+    else if (action === 'SEARCH_FILE')     searchFile(payload);
+    else if (action === 'FETCH_ROW')       fetchRow(payload);
+    else if (action === 'EXPORT_MATCHES')  exportMatches(payload);
+    else if (action === 'DROP_INDEX')      INDEX.delete(payload.fileId);
+    else if (action === 'CLEAR_ALL')       INDEX.clear();
   };
 
-  // ── Fast match check — no allocations ────────────────────────────────────
-  function checkMatch(cells, lq, terms, exactMatch, fuzzy) {
-    // Build search string inline — single pass
-    let s = '';
-    for (let i = 0; i < cells.length; i++) {
-      if (cells[i]) { s += cells[i]; s += '|'; }
-    }
-    const ls = s.toLowerCase();
-
-    if (exactMatch) {
-      for (let i = 0; i < cells.length; i++)
-        if (cells[i].toLowerCase() === lq) return 10;
-      return 0;
-    }
-    if (fuzzy) {
-      let score = 0;
-      for (let t = 0; t < terms.length; t++) {
-        const idx = ls.indexOf(terms[t]);
-        if (idx === -1) return 0;
-        score += idx === 0 ? 3 : 1;
-      }
-      return score;
-    }
-    const idx = ls.indexOf(lq);
-    return idx === -1 ? 0 : (idx === 0 ? 3 : 1);
-  }
-
-  function buildPreview(cells, headers, previewIdx) {
-    const parts = [];
-    for (let pi = 0; pi < previewIdx.length && parts.length < 4; pi++) {
-      const ci = previewIdx[pi];
-      if (cells[ci]) parts.push(headers[ci] + ': ' + cells[ci]);
-    }
-    return parts.length ? parts.join(' • ') : (cells[0] || '').slice(0, 120);
-  }
-
-  function getPreviewIdx(headers) {
-    const idx = [];
-    for (let i = 0; i < headers.length && idx.length < 4; i++) {
-      const bare = headers[i].toLowerCase().replace(/^[^:]+::/, '');
-      for (const pk of PRIORITY_SET) {
-        if (bare.includes(pk)) { idx.push(i); break; }
-      }
-    }
-    return idx.length ? idx : [0,1,2].filter(i => i < headers.length);
-  }
-
-  // ── XLSX processor ────────────────────────────────────────────────────────
-  // Uses dense array-of-arrays (fastest XLSX layout).
-  // Does NOT call sheet_to_json — that creates a massive object array.
-  async function processXLSX(fileId, blob, name, path, lq, terms, exactMatch, fuzzy) {
-    const buf = await blob.arrayBuffer();
-    // raw:true skips number/date formatting — pure string values, much faster
-    const wb  = XLSX.read(buf, { type:'array', raw:true, dense:true, sheetStubs:false });
-
-    const matchedRows = new Set();
-    const rowData     = new Map();
-    let   pending     = [];
-    let   totalRows   = 0;
-    const multiSheet  = wb.SheetNames.length > 1;
-    let   fileHeaders = null;
-    let   previewIdx  = null;
-
-    const flush = () => {
-      if (pending.length) {
-        self.postMessage({ action:'MATCH_CHUNK', payload:{ fileId, matches: pending } });
-        pending = [];
-      }
-    };
-
-    for (const sName of wb.SheetNames) {
-      const ws = wb.Sheets[sName];
-      if (!ws || !ws['!data'] || ws['!data'].length < 2) continue;
-
-      const raw    = ws['!data'];
-      const hdrRaw = raw[0] || [];
-      const headers = hdrRaw.map(c => c ? String(c.v ?? '') : '');
-      const prefixed = multiSheet ? headers.map(h => sName+'::'+h) : headers;
-
-      // Only set once — first sheet defines file headers for hdrCache
-      if (!fileHeaders) {
-        fileHeaders = prefixed;
-        previewIdx  = getPreviewIdx(fileHeaders);
-        hdrCache.set(fileId, fileHeaders);
-      }
-
-      for (let r = 1; r < raw.length; r++) {
-        totalRows++;
-        const srcRow = raw[r] || [];
-        const cells  = new Array(headers.length);
-        for (let c = 0; c < headers.length; c++) {
-          const cell = srcRow[c];
-          cells[c]   = cell ? String(cell.v ?? '') : '';
-        }
-
-        const score = checkMatch(cells, lq, terms, exactMatch, fuzzy);
-        if (!score) continue;
-
-        const rowIdx = totalRows - 1;
-        matchedRows.add(rowIdx);
-        rowData.set(rowIdx, cells);
-
-        pending.push({
-          id: fileId+'-'+rowIdx, fileId,
-          fileName: name, filePath: path, sheetName: sName,
-          rowNumber: r + 1,
-          searchString: buildPreview(cells, prefixed, previewIdx || []),
-          score
-        });
-        if (pending.length >= CHUNK_SIZE) flush();
-      }
-    }
-
-    flush();
-    return { matchedRows, rowData, totalRows };
-  }
-
-  // ── CSV processor ─────────────────────────────────────────────────────────
-  async function processCSV(fileId, blob, name, path, lq, terms, exactMatch, fuzzy) {
-    const text    = await blob.text();
-    const matchedRows = new Set();
-    const rowData     = new Map();
-    let   pending     = [];
-    let   totalRows   = 0;
-    let   headers     = null;
-    let   previewIdx  = null;
-
-    const flush = () => {
-      if (pending.length) {
-        self.postMessage({ action:'MATCH_CHUNK', payload:{ fileId, matches: pending } });
-        pending = [];
-      }
-    };
-
-    Papa.parse(text, {
-      skipEmptyLines: true,
-      step: ({ data }) => {
-        if (!headers) {
-          headers    = data.map(v => String(v ?? ''));
-          previewIdx = getPreviewIdx(headers);
-          hdrCache.set(fileId, headers);
-          return;
-        }
-        totalRows++;
-        const cells  = data.map(v => String(v ?? ''));
-        const rowIdx = totalRows - 1;
-        const score  = checkMatch(cells, lq, terms, exactMatch, fuzzy);
-        if (!score) return;
-
-        matchedRows.add(rowIdx);
-        rowData.set(rowIdx, cells);
-        pending.push({
-          id: fileId+'-'+rowIdx, fileId,
-          fileName: name, filePath: path, sheetName: null,
-          rowNumber: totalRows + 1,
-          searchString: buildPreview(cells, headers, previewIdx || []),
-          score
-        });
-        if (pending.length >= CHUNK_SIZE) flush();
-      }
-    });
-
-    flush();
-    return { matchedRows, rowData, totalRows };
-  }
-
-  // ── TXT processor ─────────────────────────────────────────────────────────
-  async function processTXT(fileId, blob, name, path, lq, terms, exactMatch, fuzzy) {
-    const text    = await blob.text();
-    const lines   = text.split(/\r?\n/);
-    const matchedRows = new Set();
-    const rowData     = new Map();
-    let   pending     = [];
-    let   totalRows   = 0;
-
-    hdrCache.set(fileId, ['line']);
-
-    const flush = () => {
-      if (pending.length) {
-        self.postMessage({ action:'MATCH_CHUNK', payload:{ fileId, matches: pending } });
-        pending = [];
-      }
-    };
-
-    for (let i = 0; i < lines.length; i++) {
-      const l = lines[i].trim();
-      if (!l) continue;
-      totalRows++;
-      const cells  = [l];
-      const rowIdx = totalRows - 1;
-      const score  = checkMatch(cells, lq, terms, exactMatch, fuzzy);
-      if (!score) continue;
-
-      matchedRows.add(rowIdx);
-      rowData.set(rowIdx, cells);
-      pending.push({
-        id: fileId+'-'+rowIdx, fileId,
-        fileName: name, filePath: path, sheetName: null,
-        rowNumber: i + 1,
-        searchString: l.slice(0, 120),
-        score
-      });
-      if (pending.length >= CHUNK_SIZE) flush();
-    }
-
-    flush();
-    return { matchedRows, rowData, totalRows };
-  }
-
-  // ── Main dispatcher ───────────────────────────────────────────────────────
-  async function processFile({ fileId, blob, type, name, path, query, exactMatch, fuzzy }) {
-    fileCache.set(fileId, { blob, type, name, path });
-    matchCache.delete(fileId);
-    rowCache.delete(fileId);
-    hdrCache.delete(fileId);
-
-    const lq    = query.toLowerCase().trim();
-    const terms = lq.split(/\s+/).filter(t => t.length > 0);
-
+  // ── PHASE 1: Index a file (done once per file load) ──────────────────────
+  async function indexFile({ fileId, blob, type, name }) {
     try {
-      let result;
-      if      (type === 'xlsx' || type === 'xls') result = await processXLSX(fileId, blob, name, path, lq, terms, exactMatch, fuzzy);
-      else if (type === 'csv')                    result = await processCSV(fileId, blob, name, path, lq, terms, exactMatch, fuzzy);
-      else                                        result = await processTXT(fileId, blob, name, path, lq, terms, exactMatch, fuzzy);
+      const flatLines = [];  // lowercase concatenated row strings for search
+      const rawRows   = [];  // original cells for display
+      const sheets    = [];  // sheet name per row
+      let   headers   = [];
 
-      matchCache.set(fileId, result.matchedRows);
-      rowCache.set(fileId, result.rowData);
-      self.postMessage({ action:'FILE_COMPLETE', payload:{ fileId, totalRows: result.totalRows } });
+      if (type === 'xlsx' || type === 'xls') {
+        const buf = await blob.arrayBuffer();
+        const wb  = XLSX.read(buf, { type:'array', raw:true, dense:true, sheetStubs:false });
+        const multi = wb.SheetNames.length > 1;
+
+        for (const sName of wb.SheetNames) {
+          const ws = wb.Sheets[sName];
+          if (!ws || !ws['!data'] || ws['!data'].length < 2) continue;
+          const data   = ws['!data'];
+          const hdrRow = data[0] || [];
+          const hdrs   = hdrRow.map(c => c ? String(c.v ?? '') : '');
+
+          // Only set headers from first sheet
+          if (!headers.length) {
+            headers = multi ? hdrs.map(h => sName+'::'+h) : hdrs;
+          }
+
+          for (let r = 1; r < data.length; r++) {
+            const src   = data[r] || [];
+            const cells = new Array(hdrs.length);
+            let   flat  = '';
+            for (let c = 0; c < hdrs.length; c++) {
+              const v  = src[c] ? String(src[c].v ?? '') : '';
+              cells[c] = v;
+              if (v) { flat += v; flat += '|'; }
+            }
+            flatLines.push(flat.toLowerCase());
+            rawRows.push(cells);
+            sheets.push(sName);
+          }
+        }
+
+      } else if (type === 'csv') {
+        const text  = await blob.text();
+        let   first = true;
+        Papa.parse(text, {
+          skipEmptyLines: true,
+          step: ({ data }) => {
+            if (first) { headers = data.map(v => String(v ?? '')); first = false; return; }
+            const cells = data.map(v => String(v ?? ''));
+            let flat = '';
+            for (let i = 0; i < cells.length; i++) {
+              if (cells[i]) { flat += cells[i]; flat += '|'; }
+            }
+            flatLines.push(flat.toLowerCase());
+            rawRows.push(cells);
+            sheets.push(null);
+          }
+        });
+
+      } else {
+        // TXT
+        headers = ['line'];
+        const text  = await blob.text();
+        const lines = text.split(/\r?\n/);
+        for (const l of lines) {
+          const t = l.trim();
+          if (!t) continue;
+          flatLines.push(t.toLowerCase());
+          rawRows.push([t]);
+          sheets.push(null);
+        }
+      }
+
+      INDEX.set(fileId, { flatLines, rawRows, headers, sheets, name });
+      self.postMessage({ action:'INDEX_DONE', payload:{ fileId, rowCount: flatLines.length } });
     } catch(err) {
-      self.postMessage({ action:'FILE_ERROR', payload:{ fileId, error: err.message } });
+      self.postMessage({ action:'INDEX_ERROR', payload:{ fileId, error: err.message } });
     }
   }
 
-  // ── Row detail — instant from rowCache ────────────────────────────────────
-  function fetchRowDetail({ fileId, rowNumber }) {
-    const rows    = rowCache.get(fileId);
-    const headers = hdrCache.get(fileId);
-    const rowIdx  = rowNumber - 2;
-
-    if (!rows || !headers || !rows.has(rowIdx)) {
-      self.postMessage({ action:'ROW_DETAIL_RESULT', payload:{ fileId, rowNumber, rowData: null } });
+  // ── PHASE 2: Search (pure JS, no I/O, no parsing) ────────────────────────
+  function searchFile({ fileId, query, exactMatch, fuzzy, searchId }) {
+    const idx = INDEX.get(fileId);
+    if (!idx) {
+      self.postMessage({ action:'SEARCH_ERROR', payload:{ fileId, searchId, error:'Not indexed' } });
       return;
     }
-    const cells = rows.get(rowIdx);
-    const obj   = {};
-    for (let i = 0; i < headers.length; i++) {
-      const bare = headers[i].replace(/^[^:]+::/, '');
-      obj[bare]  = cells[i] || '';
+
+    const { flatLines, rawRows, headers, sheets, name } = idx;
+    const lq    = query.toLowerCase().trim();
+    const terms = lq.split(/\s+/).filter(t => t.length > 0);
+    const empty = !lq;
+
+    // Pre-compute priority preview column indices once
+    const previewIdx = [];
+    for (let i = 0; i < headers.length && previewIdx.length < 4; i++) {
+      const bare = headers[i].toLowerCase().replace(/^[^:]+::/, '');
+      for (const pk of PRIO) { if (bare.includes(pk)) { previewIdx.push(i); break; } }
     }
-    self.postMessage({ action:'ROW_DETAIL_RESULT', payload:{ fileId, rowNumber, rowData: obj } });
-  }
+    if (!previewIdx.length) {
+      for (let i = 0; i < Math.min(3, headers.length); i++) previewIdx.push(i);
+    }
 
-  // ── Export — re-streams from blob (export is infrequent) ─────────────────
-  async function generateExport() {
-    const parts   = [];
-    let firstFile = true;
+    const matches = [];
 
-    for (const [fileId, matched] of matchCache.entries()) {
-      if (!matched.size) continue;
-      const info    = fileCache.get(fileId);
-      const headers = hdrCache.get(fileId);
-      if (!info || !headers) continue;
+    for (let ri = 0; ri < flatLines.length; ri++) {
+      const flat = flatLines[ri];
+      let score  = 0;
 
-      const bareHdrs = headers.map(h => h.replace(/^[^:]+::/, ''));
-      if (firstFile) {
-        parts.push(['FileName','Sheet','RowNumber',...bareHdrs]
-          .map(h => '"'+h.replace(/"/g,'""')+'"').join(','));
-        firstFile = false;
+      if (empty) {
+        score = 1;
+      } else if (exactMatch) {
+        // Exact: check each raw cell
+        const cells = rawRows[ri];
+        for (let ci = 0; ci < cells.length; ci++) {
+          if (cells[ci].toLowerCase() === lq) { score = 10; break; }
+        }
+      } else if (fuzzy) {
+        // All terms must appear
+        let s = 0, ok = true;
+        for (let t = 0; t < terms.length; t++) {
+          const pos = flat.indexOf(terms[t]);
+          if (pos === -1) { ok = false; break; }
+          s += pos === 0 ? 3 : 1;
+        }
+        if (ok) score = s;
+      } else {
+        // Substring
+        const pos = flat.indexOf(lq);
+        if (pos !== -1) score = pos === 0 ? 3 : 1;
       }
 
-      for (const [rowIdx, cells] of rowCache.get(fileId)?.entries() || []) {
-        if (!matched.has(rowIdx)) continue;
-        parts.push([
-          '"'+info.name.replace(/"/g,'""')+'"',
-          '"N/A"',
-          rowIdx+2,
+      if (!score) continue;
+
+      // Build preview from raw cells
+      const cells = rawRows[ri];
+      const parts = [];
+      for (let pi = 0; pi < previewIdx.length; pi++) {
+        const v = cells[previewIdx[pi]];
+        if (v) {
+          const h = headers[previewIdx[pi]].replace(/^[^:]+::/, '');
+          parts.push(h + ': ' + v);
+        }
+      }
+
+      matches.push({
+        id:           fileId + '-' + ri,
+        fileId,
+        fileName:     name,
+        sheetName:    sheets[ri],
+        rowNumber:    ri + 2,
+        searchString: parts.length ? parts.join(' • ') : (cells[0] || '').slice(0, 100),
+        score,
+        _ri: ri   // keep for row detail lookup
+      });
+
+      if (matches.length >= CHUNK) {
+        self.postMessage({ action:'SEARCH_CHUNK', payload:{ fileId, searchId, matches: matches.splice(0) } });
+      }
+    }
+
+    if (matches.length) {
+      self.postMessage({ action:'SEARCH_CHUNK', payload:{ fileId, searchId, matches } });
+    }
+    self.postMessage({ action:'SEARCH_DONE', payload:{ fileId, searchId } });
+  }
+
+  // ── Row detail — O(1) from index ──────────────────────────────────────────
+  function fetchRow({ fileId, ri }) {
+    const idx = INDEX.get(fileId);
+    if (!idx || !idx.rawRows[ri]) {
+      self.postMessage({ action:'ROW_DATA', payload:{ fileId, ri, data: null } });
+      return;
+    }
+    const cells = idx.rawRows[ri];
+    const obj   = {};
+    for (let i = 0; i < idx.headers.length; i++) {
+      obj[idx.headers[i].replace(/^[^:]+::/, '')] = cells[i] || '';
+    }
+    self.postMessage({ action:'ROW_DATA', payload:{ fileId, ri, data: obj } });
+  }
+
+  // ── Export matched rows ───────────────────────────────────────────────────
+  function exportMatches({ matches }) {
+    if (!matches.length) {
+      self.postMessage({ action:'EXPORT_READY', payload:{ blob: new Blob([''], { type:'text/csv' }) } });
+      return;
+    }
+    const lines = [];
+    // Group by fileId to get headers
+    const byFile = new Map();
+    for (const m of matches) {
+      if (!byFile.has(m.fileId)) byFile.set(m.fileId, []);
+      byFile.get(m.fileId).push(m);
+    }
+
+    let wroteHeader = false;
+    for (const [fileId, ms] of byFile) {
+      const idx = INDEX.get(fileId);
+      if (!idx) continue;
+      const bareHdrs = idx.headers.map(h => h.replace(/^[^:]+::/, ''));
+      if (!wroteHeader) {
+        lines.push(['FileName','Sheet','RowNumber',...bareHdrs]
+          .map(h => '"'+h.replace(/"/g,'""')+'"').join(','));
+        wroteHeader = true;
+      }
+      for (const m of ms) {
+        const cells = idx.rawRows[m._ri] || [];
+        lines.push([
+          '"'+idx.name.replace(/"/g,'""')+'"',
+          '"'+(m.sheetName||'N/A')+'"',
+          m.rowNumber,
           ...cells.map(v => '"'+String(v).replace(/"/g,'""')+'"')
         ].join(','));
       }
     }
-
     self.postMessage({ action:'EXPORT_READY',
-      payload:{ blob: new Blob([parts.join('\n')], { type:'text/csv' }) } });
+      payload:{ blob: new Blob([lines.join('\n')], { type:'text/csv' }) } });
   }
 `;
