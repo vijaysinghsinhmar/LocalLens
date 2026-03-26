@@ -4,7 +4,7 @@ import {
   Loader2, CheckCircle2, AlertCircle, ChevronDown,
   FileSpreadsheet, FileCode, FileText
 } from 'lucide-react';
-import { workerScript } from './worker';
+import workerScript from './engine.js?raw';
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Types
