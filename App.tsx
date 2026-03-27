@@ -114,14 +114,12 @@ export default function App() {
         const d = ev.data;
 
         if (d.t === 'ok') {
-          /* ---- index done ---- */
-          const f = iQ.current.find(x=>x.id===d.id) || indexed.current.get(d.id);
-          // Update indexed map synchronously
+          // Store in indexed map SYNCHRONOUSLY before any setState
+          // Use the file list snapshot to get type/name etc.
           setFiles(prev => {
             const nx = prev.map(x => x.id===d.id ? {...x, st:'ok' as const, rows:d.n} : x);
-            // store in indexed map
-            const entry = nx.find(x=>x.id===d.id);
-            if (entry) indexed.current.set(d.id, entry);
+            const entry = nx.find(x => x.id===d.id);
+            if (entry) indexed.current.set(d.id, {...entry, rows:d.n, st:'ok'});
             return nx;
           });
           setTotR(r => r + d.n);

@@ -5,8 +5,7 @@ self.importScripts(
   'https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js'
 );
 
-// DB: fileId -> { name, flat[], rows[], headers[], sheets[] }
-var DB = {};
+var DB = {}; // fileId -> {name, type, flat:string[], rows:string[][], headers:string[], sheets:(string|null)[]}
 
 self.onmessage = function(ev) {
   var d = ev.data;
@@ -14,10 +13,9 @@ self.onmessage = function(ev) {
   else if (d.t === 'search') doSearch(d);
   else if (d.t === 'row')    doRow(d);
   else if (d.t === 'export') doExport(d);
-  else if (d.t === 'clear')  DB = {};
+  else if (d.t === 'clear')  { DB = {}; }
 };
 
-// ── INDEX ─────────────────────────────────────────────────────────────────────
 function doIndex(msg) {
   var id   = msg.id;
   var type = msg.ft;
@@ -29,41 +27,39 @@ function doIndex(msg) {
 
     if (type === 'xlsx' || type === 'xls') {
       var buf = fr.readAsArrayBuffer(msg.blob);
-      var wb  = XLSX.read(new Uint8Array(buf), {
-        type: 'array', raw: true, dense: true,
-        cellDates: false, cellNF: false, cellStyles: false
-      });
+      var wb  = XLSX.read(buf, { type: 'array', raw: true, dense: true });
       var multi = wb.SheetNames.length > 1;
 
       for (var si = 0; si < wb.SheetNames.length; si++) {
         var sName = wb.SheetNames[si];
-        var ws    = wb.Sheets[sName];
-        if (!ws || !ws['!data'] || ws['!data'].length < 2) continue;
+        var ws = wb.Sheets[sName];
+        if (!ws) continue;
 
-        var data = ws['!data'];
-        var hdrRow = data[0] || [];
+        // Use sheet_to_json for reliable parsing - dense mode direct access was missing rows
+        var jsonRows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '', raw: false });
+        if (!jsonRows || jsonRows.length < 2) continue;
+
+        var hdrRow = jsonRows[0];
         var hdrs = [];
-        for (var hi = 0; hi < hdrRow.length; hi++) {
-          var hc = hdrRow[hi];
-          hdrs.push(hc ? String(hc.v != null ? hc.v : '') : '');
+        for (var c = 0; c < hdrRow.length; c++) {
+          hdrs.push(String(hdrRow[c] || ''));
         }
+        if (!hdrs.length) continue;
 
         if (!headers.length) {
           headers = multi ? hdrs.map(function(h){ return sName + '::' + h; }) : hdrs.slice();
         }
 
-        for (var r = 1; r < data.length; r++) {
-          var src   = data[r];
-          if (!src)  { flat.push(''); rows.push([]); sheets.push(sName); continue; }
-          var cells = [];
-          var f     = '';
+        for (var r = 1; r < jsonRows.length; r++) {
+          var srcRow = jsonRows[r];
+          var cells  = [];
+          var flat_  = '';
           for (var c = 0; c < hdrs.length; c++) {
-            var cell = src[c];
-            var v    = cell != null ? String(cell.v != null ? cell.v : '') : '';
+            var v = String(srcRow[c] !== undefined && srcRow[c] !== null ? srcRow[c] : '');
             cells.push(v);
-            if (v) f += v + ' ';
+            if (v) flat_ += v + ' ';
           }
-          flat.push(f.toLowerCase());
+          flat.push(flat_.toLowerCase());
           rows.push(cells);
           sheets.push(sName);
         }
@@ -81,25 +77,24 @@ function doIndex(msg) {
             first = false;
             return;
           }
-          var cells = [], f = '';
+          var cells = [], flat_ = '';
           for (var i = 0; i < data.length; i++) {
             var v = String(data[i] || '');
             cells.push(v);
-            if (v) f += v + ' ';
+            if (v) flat_ += v + ' ';
           }
-          flat.push(f.toLowerCase());
+          flat.push(flat_.toLowerCase());
           rows.push(cells);
           sheets.push(null);
         }
       });
 
     } else {
-      // TXT
       headers = ['line'];
       var text  = fr.readAsText(msg.blob);
       var lines = text.split('\n');
-      for (var li = 0; li < lines.length; li++) {
-        var l = lines[li].trim();
+      for (var i = 0; i < lines.length; i++) {
+        var l = lines[i].trim();
         if (!l) continue;
         flat.push(l.toLowerCase());
         rows.push([l]);
@@ -107,20 +102,21 @@ function doIndex(msg) {
       }
     }
 
-    DB[id] = { name: name, flat: flat, rows: rows, headers: headers, sheets: sheets };
-    self.postMessage({ t: 'ok', id: id, n: flat.length });
+    DB[id] = { name:name, type:type, flat:flat, rows:rows, headers:headers, sheets:sheets };
+    self.postMessage({ t:'ok', id:id, n:flat.length });
 
   } catch(e) {
-    self.postMessage({ t: 'err', id: id, msg: String(e ? (e.message || e) : 'unknown') });
+    self.postMessage({ t:'err', id:id, msg:String(e && e.message ? e.message : e) });
   }
 }
 
-// ── SEARCH ────────────────────────────────────────────────────────────────────
 function doSearch(msg) {
   var sid   = msg.sid;
-  var entry = DB[msg.id];
-  if (!entry) {
-    self.postMessage({ t: 'done', sid: sid, id: msg.id });
+  var id    = msg.id;
+  var entry = DB[id];
+
+  if (!entry || !entry.flat || !entry.flat.length) {
+    self.postMessage({ t:'done', sid:sid, id:id });
     return;
   }
 
@@ -133,14 +129,21 @@ function doSearch(msg) {
   var q     = String(msg.q || '').toLowerCase().trim();
   var exact = !!msg.exact;
   var fuzzy = !!msg.fuzzy;
-  var terms = q ? q.split(' ').filter(function(t){ return t.length > 0; }) : [];
+  var terms = [];
+  if (q) {
+    var parts = q.split(' ');
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].length > 0) terms.push(parts[i]);
+    }
+  }
   var empty = (q === '');
 
-  // Pre-compute priority preview indices (once per search per file)
-  var PRIO = ['date','amount','debit','credit','balance','name','particulars',
-              'ref','narration','description','utr','account'];
+  // Preview column indices
+  var PRIO = ['date','amount','debit','credit','balance','particular',
+              'narration','description','ref','name','utr','account'];
   var pi = [];
-  for (var hi = 0; hi < hdrs.length && pi.length < 4; hi++) {
+  for (var hi = 0; hi < hdrs.length; hi++) {
+    if (pi.length >= 4) break;
     var bare = hdrs[hi].toLowerCase().replace(/^[^:]+::/, '');
     for (var p = 0; p < PRIO.length; p++) {
       if (bare.indexOf(PRIO[p]) !== -1) { pi.push(hi); break; }
@@ -150,8 +153,7 @@ function doSearch(msg) {
     for (var i = 0; i < Math.min(3, hdrs.length); i++) pi.push(i);
   }
 
-  var hits  = [];
-  var CHUNK = 300;
+  var hits = [], CHUNK = 300;
 
   for (var ri = 0; ri < flat.length; ri++) {
     var f  = flat[ri];
@@ -171,10 +173,10 @@ function doSearch(msg) {
         if (pos === -1) { ok = false; break; }
         s += (pos === 0 ? 3 : 1);
       }
-      if (ok) sc = (s || 1);
+      if (ok) sc = s || 1;
     } else {
-      var idx = f.indexOf(q);
-      if (idx !== -1) sc = (idx === 0 ? 3 : 1);
+      var pos2 = f.indexOf(q);
+      if (pos2 !== -1) sc = (pos2 === 0 ? 3 : 1);
     }
 
     if (!sc) continue;
@@ -187,8 +189,8 @@ function doSearch(msg) {
     }
 
     hits.push({
-      id:  msg.id + '-' + ri,
-      fid: msg.id,
+      id:  id + '-' + ri,
+      fid: id,
       fn:  name,
       sn:  shts[ri],
       rn:  ri + 2,
@@ -198,70 +200,59 @@ function doSearch(msg) {
     });
 
     if (hits.length >= CHUNK) {
-      self.postMessage({ t: 'hits', sid: sid, hits: hits.slice() });
-      hits.length = 0;
+      self.postMessage({ t:'hits', sid:sid, hits:hits.splice(0) });
     }
   }
 
-  if (hits.length) self.postMessage({ t: 'hits', sid: sid, hits: hits });
-  self.postMessage({ t: 'done', sid: sid, id: msg.id });
+  if (hits.length) self.postMessage({ t:'hits', sid:sid, hits:hits });
+  self.postMessage({ t:'done', sid:sid, id:id });
 }
 
-// ── ROW DETAIL ────────────────────────────────────────────────────────────────
 function doRow(msg) {
   var e = DB[msg.id];
   if (!e || !e.rows[msg.ri]) {
-    self.postMessage({ t: 'row', id: msg.id, ri: msg.ri, d: null });
+    self.postMessage({ t:'row', id:msg.id, ri:msg.ri, d:null });
     return;
   }
   var cells = e.rows[msg.ri];
   var obj   = {};
   for (var i = 0; i < e.headers.length; i++) {
-    var k  = e.headers[i].replace(/^[^:]+::/, '') || ('col' + i);
+    var k = e.headers[i].replace(/^[^:]+::/, '') || ('col' + i);
     obj[k] = cells[i] || '';
   }
-  self.postMessage({ t: 'row', id: msg.id, ri: msg.ri, d: obj });
+  self.postMessage({ t:'row', id:msg.id, ri:msg.ri, d:obj });
 }
 
-// ── EXPORT ────────────────────────────────────────────────────────────────────
 function doExport(msg) {
   var hits = msg.hits || [];
   if (!hits.length) {
-    self.postMessage({ t: 'csv', blob: new Blob([''], { type: 'text/csv' }) });
+    self.postMessage({ t:'csv', blob: new Blob([''], {type:'text/csv'}) });
     return;
   }
-
-  var lines  = [];
-  var byFile = {};
+  var lines = [], byFile = {};
   for (var i = 0; i < hits.length; i++) {
-    var h = hits[i];
-    if (!byFile[h.fid]) byFile[h.fid] = [];
-    byFile[h.fid].push(h);
+    if (!byFile[hits[i].fid]) byFile[hits[i].fid] = [];
+    byFile[hits[i].fid].push(hits[i]);
   }
-
-  var wroteHdr = false;
+  var wrote = false;
   for (var fid in byFile) {
     var e = DB[fid];
     if (!e) continue;
     var bh = e.headers.map(function(h){ return h.replace(/^[^:]+::/, ''); });
-    if (!wroteHdr) {
+    if (!wrote) {
       lines.push(['File','Sheet','Row'].concat(bh)
-        .map(function(x){ return '"' + String(x).replace(/"/g, '""') + '"'; }).join(','));
-      wroteHdr = true;
+        .map(function(x){ return '"' + String(x).replace(/"/g,'""') + '"'; }).join(','));
+      wrote = true;
     }
     var fhits = byFile[fid];
     for (var j = 0; j < fhits.length; j++) {
-      var m  = fhits[j];
-      var cr = e.rows[m.ri] || [];
+      var m = fhits[j], cr = e.rows[m.ri] || [];
       lines.push([
-        '"' + e.name.replace(/"/g, '""') + '"',
-        '"' + (m.sn || 'N/A') + '"',
+        '"' + e.name.replace(/"/g,'""') + '"',
+        '"' + (m.sn || '') + '"',
         m.rn
-      ].concat(cr.map(function(v){
-        return '"' + String(v).replace(/"/g, '""') + '"';
-      })).join(','));
+      ].concat(cr.map(function(v){ return '"' + String(v).replace(/"/g,'""') + '"'; })).join(','));
     }
   }
-
-  self.postMessage({ t: 'csv', blob: new Blob([lines.join('\n')], { type: 'text/csv' }) });
+  self.postMessage({ t:'csv', blob: new Blob([lines.join('\n')], {type:'text/csv'}) });
 }
