@@ -111,11 +111,12 @@ export default function App() {
       setHits(allHits.current.slice(0, MAX_H));
     }
 
-    function dispatchIdx(wi:number) {
+    function dispatchIdx(_wi:number) {
+      // Always use worker 0 for indexing — serialised to prevent OOM
       if (!iQ.current.length) return;
       const f = iQ.current.shift()!;
       setFiles(prev => prev.map(x => x.id===f.id ? {...x,st:'ing' as const} : x));
-      WW.current[wi].postMessage({t:'idx', id:f.id, blob:f.blob, ft:f.type, name:f.name});
+      WW.current[0].postMessage({t:'idx', id:f.id, blob:f.blob, ft:f.type, name:f.name});
     }
 
     WW.current = Array.from({length:NW}, (_, wi) => {
@@ -181,10 +182,11 @@ export default function App() {
     }
     if (!list.length) return;
     setFiles(list); iQ.current = list.slice();
-    for (let wi = 0; wi < NW && iQ.current.length; wi++) {
+    // Only seed worker 0 for indexing — one file at a time prevents OOM on large folders
+    if (iQ.current.length) {
       const f = iQ.current.shift()!;
       setFiles(prev => prev.map(x => x.id===f.id ? {...x, st:'ing' as const} : x));
-      WW.current[wi].postMessage({t:'idx', id:f.id, blob:f.blob, ft:f.type, name:f.name});
+      WW.current[0].postMessage({t:'idx', id:f.id, blob:f.blob, ft:f.type, name:f.name});
     }
   }, []);
 
