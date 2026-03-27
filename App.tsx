@@ -68,6 +68,7 @@ export default function App() {
   const [expId,   setExpId]   = useState<string|null>(null);
   const [expD,    setExpD]    = useState<Record<string,string>|null>(null);
   const [expLoad, setExpLoad] = useState(false);
+  const [hitCount, setHitCount] = useState(0); // mirrors allHits.current.length for re-render
   const [sTop,    setSTop]    = useState(0);
   const [vH,      setVH]      = useState(600);
   const scEl = useRef<HTMLDivElement>(null);
@@ -109,6 +110,7 @@ export default function App() {
       const snap = sBuf.current.splice(0);
       allHits.current.push(...snap);
       setHits(allHits.current.slice(0, MAX_H));
+      setHitCount(allHits.current.length);
     }
 
     function dispatchIdx(_wi:number) {
@@ -124,11 +126,12 @@ export default function App() {
       w.onmessage = (ev) => {
         const d = ev.data;
         if (d.t === 'ok') {
+          // FIX: update indexed map BEFORE setFiles to ensure it's always current
+          // setFiles updater may run async; indexed.current must be synchronous
           setFiles(prev => {
-            const nx = prev.map(x => x.id===d.id ? {...x, st:'ok' as const, rows:d.n} : x);
-            const entry = nx.find(x => x.id===d.id);
-            if (entry) indexed.current.set(d.id, {...entry, rows:d.n, st:'ok'});
-            return nx;
+            const entry = prev.find(x => x.id===d.id);
+            if (entry) indexed.current.set(d.id, {...entry, rows:d.n, st:'ok' as const});
+            return prev.map(x => x.id===d.id ? {...x, st:'ok' as const, rows:d.n} : x);
           });
           setTotR(r => r + d.n);
           dispatchIdx(wi);
@@ -160,7 +163,12 @@ export default function App() {
       return w;
     });
 
-    return () => { WW.current.forEach(w => w.terminate()); URL.revokeObjectURL(url); };
+    return () => {
+      WW.current.forEach(w => w.terminate());
+      URL.revokeObjectURL(url);
+      clearInterval(tickT.current);
+      clearTimeout(debT.current);
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -171,7 +179,7 @@ export default function App() {
     indexed.current.clear(); iQ.current = [];
     allHits.current = []; sBuf.current = [];
     setHits([]); setQuery(''); queryRef.current = '';
-    setElapsed(null); setTotR(0); setExpId(null); setExpD(null);
+    setElapsed(null); setTotR(0); setExpId(null); setExpD(null); setHitCount(0);
     const list:FM[] = [];
     for (let i = 0; i < raw.length; i++) {
       const f = raw[i];
@@ -198,7 +206,7 @@ export default function App() {
     sBuf.current = []; allHits.current = [];
     sDone.current = 0; sTotal.current = targets.length;
     sStart.current = Date.now();
-    setHits([]); setElapsed(null); setBusy(true); setExpId(null); setExpD(null);
+    setHits([]); setElapsed(null); setBusy(true); setExpId(null); setExpD(null); setHitCount(0);
     clearInterval(tickT.current);
     tickT.current = setInterval(() => setElapsed(Date.now()-sStart.current), 100) as unknown as number;
     targets.forEach((f, i) => {
@@ -326,7 +334,7 @@ export default function App() {
               webkitdirectory="" directory="" multiple onChange={loadFolder}/>
           </label>
 
-          {allHits.current.length > 0 && (
+          {hitCount > 0 && (
             <button className="ll-btn ll-btn-accent"
               onClick={() => WW.current[0].postMessage({t:'export', hits:allHits.current})}>
               <Download size={13}/> EXPORT
@@ -532,7 +540,7 @@ const NoResults = memo(({q}:{q:string}) => (
 /* ── Highlight ──────────────────────────────────────────────────────────── */
 const Hl = memo(({text,q}:{text:string;q:string}) => {
   if (!q.trim()||!text) return <>{text}</>;
-  const terms = q.trim().split(/\s+/).filter(t=>t.length>1);
+  const terms = q.trim().split(/\s+/).filter(t=>t.length>0);
   if (!terms.length) return <>{text}</>;
   try {
     const re = new RegExp(`(${terms.map(t=>t.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|')})`, 'gi');
