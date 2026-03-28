@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useMemo, useCallback, memo } from 'react';
+import React, { useEffect, useRef, useState, useMemo, useCallback, memo, startTransition } from 'react';
 import {
   Zap, FolderOpen, Search, X, Download,
   Loader2, CheckCircle2, AlertCircle, ChevronDown,
@@ -65,6 +65,7 @@ export default function App() {
   const [exts,    setExts]    = useState(['xlsx','xls','csv','txt']);
   const [sortK,   setSortK]   = useState<'sc'|'fn'|'rn'>('sc');
   const [sortD,   setSortD]   = useState<1|-1>(-1);
+  const [sortedHits, setSortedHits] = useState<Hit[]>([]); // FIX #12: pre-sorted state
   const [expId,   setExpId]   = useState<string|null>(null);
   const [expD,    setExpD]    = useState<Record<string,string>|null>(null);
   const [expLoad, setExpLoad] = useState(false);
@@ -108,7 +109,7 @@ export default function App() {
     function flushHits() {
       if (!sBuf.current.length) return;
       const snap = sBuf.current.splice(0);
-      allHits.current.push(...snap);
+      Array.prototype.push.apply(allHits.current, snap); // FIX #21
       setHits(allHits.current.slice(0, MAX_H));
       setHitCount(allHits.current.length);
     }
@@ -175,6 +176,7 @@ export default function App() {
   const loadFolder = useCallback((e:React.ChangeEvent<HTMLInputElement>) => {
     const raw = e.target.files;
     if (!raw) return;
+    e.target.value = ''; // FIX #15: reset so same folder can be re-selected
     WW.current.forEach(w => w.postMessage({t:'clear'}));
     indexed.current.clear(); iQ.current = [];
     allHits.current = []; sBuf.current = [];
@@ -210,7 +212,8 @@ export default function App() {
     clearInterval(tickT.current);
     tickT.current = setInterval(() => setElapsed(Date.now()-sStart.current), 100) as unknown as number;
     targets.forEach((f, i) => {
-      WW.current[i % NW].postMessage({t:'search', sid:newSid, id:f.id, q, fuzzy:fuzzyRef.current, exact:exactRef.current});
+      // FIX #17: use worker 1+ only for search — worker 0 is reserved for indexing
+      WW.current[NW === 1 ? 0 : 1 + (i % (NW - 1))].postMessage({t:'search', sid:newSid, id:f.id, q, fuzzy:fuzzyRef.current, exact:exactRef.current});
     });
   }, []);
 
@@ -225,19 +228,29 @@ export default function App() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fuzzy, exact, exts]);
 
+  // FIX #16: stable expand callback — avoids re-rendering all memo'd HitRows on each expand
+  const expIdRef = useRef<string|null>(null);
   const expand = useCallback((h:Hit) => {
-    if (expId === h.id) { setExpId(null); setExpD(null); return; }
+    if (expIdRef.current === h.id) {
+      expIdRef.current = null;
+      setExpId(null); setExpD(null); return;
+    }
+    expIdRef.current = h.id;
     setExpId(h.id); setExpD(null); setExpLoad(true);
     WW.current[0].postMessage({t:'row', id:h.fid, ri:h.ri});
-  }, [expId]);
+  }, []); // stable — no deps
 
-  const sorted = useMemo(() => {
-    const a = hits.slice();
-    if      (sortK==='sc') a.sort((x,y) => sortD*(y.sc-x.sc));
-    else if (sortK==='fn') a.sort((x,y) => sortD*x.fn.localeCompare(y.fn));
-    else                   a.sort((x,y) => sortD*(x.rn-y.rn));
-    return a;
+  // FIX #12: sort in startTransition so large result sets don't block UI
+  useEffect(() => {
+    startTransition(() => {
+      const a = hits.slice();
+      if      (sortK==='sc') a.sort((x,y) => sortD*(y.sc-x.sc));
+      else if (sortK==='fn') a.sort((x,y) => sortD*x.fn.localeCompare(y.fn));
+      else                   a.sort((x,y) => sortD*(x.rn-y.rn));
+      setSortedHits(a);
+    });
   }, [hits, sortK, sortD]);
+  const sorted = sortedHits;
 
   const {vis, vs} = useMemo(() => {
     const s = Math.max(0, Math.floor(sTop/ROW_H) - OVER);
@@ -250,7 +263,7 @@ export default function App() {
   const ready = !isIdx && nOk > 0;
   const totSz = files.reduce((s,f)=>s+f.size,0);
   const pct   = files.length ? Math.round(nOk/files.length*100) : 0;
-  const capped = allHits.current.length >= MAX_H;
+  const capped = hitCount >= MAX_H; // FIX #11: use state not ref
 
   return (
     <div className="ll-root">
@@ -384,7 +397,11 @@ export default function App() {
 
       {/* ══ BODY ════════════════════════════════════════════════════════ */}
       <div className="ll-body" ref={scEl}
-        onScroll={e => setSTop(e.currentTarget.scrollTop)}>
+        onScroll={e => {
+          setSTop(e.currentTarget.scrollTop);
+          // FIX #13: close expanded row on scroll to keep virtual height consistent
+          if (expId) { setExpId(null); setExpD(null); }
+        }}>
 
         {files.length === 0 && <WelcomeScreen/>}
         {files.length > 0 && isIdx && hits.length === 0 && !query && <IndexingScreen files={files}/>}
@@ -614,8 +631,6 @@ const HitRow = memo(({h,open,data,loading,onOpen,q}:{
 /* ── CSS ─────────────────────────────────────────────────────────────────── */
 {
   const css = `
-    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
-
     @keyframes spin { to { transform:rotate(360deg) } }
     @keyframes fadeIn { from { opacity:0; transform:translateY(4px) } to { opacity:1; transform:none } }
     @keyframes pulse-dot { 0%,100% { opacity:1 } 50% { opacity:0.3 } }
