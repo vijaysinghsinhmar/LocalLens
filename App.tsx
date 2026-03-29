@@ -5,7 +5,7 @@ import {
   FileSpreadsheet, FileCode, FileText, ScanSearch
 } from 'lucide-react';
 // Vite worker import — bundled at build time, no CDN, no importScripts
-import SearchWorker from './worker.ts?worker';
+import SearchWorker from './worker.ts?worker&inline';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface FM {
@@ -205,15 +205,24 @@ export default function App() {
 
     const list: FM[] = [];
     for (let i = 0; i < raw.length; i++) {
-      const f   = raw[i];
-      const ext = (f.name.split('.').pop()||'').toLowerCase();
+      const f    = raw[i];
+      // Skip directory entries — they have size 0 and no real extension
+      if (f.size === 0) continue;
+      const parts = f.name.split('.');
+      if (parts.length < 2) continue;
+      const ext   = parts[parts.length - 1].toLowerCase();
       if (!SUPP.has(ext)) continue;
       list.push({
         id:   `${f.name}-${f.size}-${f.lastModified}`,
         name: f.name, type: ext, blob: f, size: f.size, st:'q', rows:0
       });
     }
-    if (!list.length) { alert('No supported files found (xlsx, xls, csv, txt)'); return; }
+    if (!list.length) {
+      // Show what was actually received for debugging
+      const names = Array.from(raw).slice(0,5).map(f=>f.name+'('+f.size+')').join(', ');
+      alert(`No supported files (xlsx/xls/csv/txt) found.\nReceived: ${names}${raw.length>5?'...':''}`);
+      return;
+    }
 
     setFiles(list);
     iQueueRef.current = list.slice();

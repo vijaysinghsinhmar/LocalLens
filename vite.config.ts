@@ -15,13 +15,9 @@ export default defineConfig({
   build: {
     target: 'esnext',
     minify: 'esbuild',
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          react: ['react', 'react-dom'],
-        }
-      }
-    }
+  },
+  worker: {
+    format: 'iife',  // iife = works in all browsers, no ES module import issues
   },
   resolve: {
     alias: {
