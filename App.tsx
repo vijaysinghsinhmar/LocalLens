@@ -177,9 +177,12 @@ export default function App() {
 
   // ── Load folder ────────────────────────────────────────────────────────────
   function loadFolder(e: React.ChangeEvent<HTMLInputElement>) {
-    const raw = e.target.files;
-    if (!raw || !raw.length) return;
-    e.target.value = '';
+    const input = e.target;
+    if (!input.files || !input.files.length) return;
+    // Copy FileList to array BEFORE clearing input value.
+    // Clearing input.value can invalidate the FileList reference in Chrome.
+    const raw: File[] = Array.from(input.files);
+    input.value = '';
 
     const w = workerRef.current;
     if (!w) { console.error('Worker not ready'); return; }
@@ -205,7 +208,7 @@ export default function App() {
 
     const list: FM[] = [];
     for (let i = 0; i < raw.length; i++) {
-      const f    = raw[i];
+      const f = raw[i];
       // Skip directory entries — they have size 0 and no real extension
       if (f.size === 0) continue;
       const parts = f.name.split('.');
@@ -219,7 +222,7 @@ export default function App() {
     }
     if (!list.length) {
       // Show what was actually received for debugging
-      const names = Array.from(raw).slice(0,5).map(f=>f.name+'('+f.size+')').join(', ');
+      const names = raw.slice(0,5).map((f:File)=>f.name+'('+f.size+')').join(', ');
       alert(`No supported files (xlsx/xls/csv/txt) found.\nReceived: ${names}${raw.length>5?'...':''}`);
       return;
     }
