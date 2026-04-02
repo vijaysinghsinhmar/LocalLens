@@ -1,37 +1,37 @@
 import * as XLSX from 'xlsx';
 import Papa from 'papaparse';
 
+// Unit separator — won't appear in normal spreadsheet data
 const SEP = '\x1F';
 
 interface DBEntry {
   name: string;
   type: string;
-  flat: string[];
-  compact: string[];
+  flat:    string[];   // lowercase search string per row
+  compact: string[];   // display values joined by SEP
   headers: string[];
-  sheets: (string|null)[];
+  sheets:  (string|null)[];
   rowNums: number[];
 }
 
 const DB = new Map<string, DBEntry>();
 
+// Split a compact string back into cell values
 function getCells(entry: DBEntry, ri: number): string[] {
   const s = entry.compact[ri];
-  return s ? s.split(SEP) : [];
+  if (!s) return [];
+  return s.split(SEP);
 }
 
-// ── Message handler — fully synchronous queue via async/await ────────────────
-// Each message is awaited before the next is processed.
-// This guarantees: idx finishes → DB populated → search finds results.
+// ── Serialised message queue — guarantees idx completes before search runs ───
 let queue = Promise.resolve();
 
 self.onmessage = (ev: MessageEvent) => {
   const d = ev.data;
-  if (d.t === 'clear') { DB.clear(); return; }
-  // Chain every operation so they never overlap
-  queue = queue.then(() => dispatch(d)).catch((e) => {
-    console.error('Worker error in', d.t, e);
-  });
+  if (d.t === 'clear') { DB.clear(); queue = Promise.resolve(); return; }
+  queue = queue
+    .then(() => dispatch(d))
+    .catch(e => console.error('[worker] unhandled in', d.t, e));
 };
 
 async function dispatch(d: any) {
@@ -39,6 +39,18 @@ async function dispatch(d: any) {
   else if (d.t === 'search')      doSearch(d);
   else if (d.t === 'row')         doRow(d);
   else if (d.t === 'export')      doExport(d);
+}
+
+// ── Cell value extraction ─────────────────────────────────────────────────────
+// Returns { display, raw } where:
+//   display = cell.w (formatted text: "15/03/2025", "1,234.56") — for compact[]
+//   raw     = cell.v as string ("45678", "1234.56") — added to flat[] too
+// This way users can search either "15/03/2025" OR "45678" and find the row.
+function cellValues(cell: any): { display: string; raw: string } {
+  if (cell == null || cell.v == null) return { display: '', raw: '' };
+  const raw     = String(cell.v);
+  const display = (cell.w != null && cell.w !== raw) ? String(cell.w) : raw;
+  return { display, raw };
 }
 
 // ── INDEX ─────────────────────────────────────────────────────────────────────
@@ -52,11 +64,19 @@ async function doIndex(msg: any) {
 
   try {
     if (type === 'xlsx' || type === 'xls') {
+
       const buf = await blob.arrayBuffer();
       const wb  = XLSX.read(buf, {
-        type: 'array', raw: true, dense: true,
-        cellDates: false, cellNF: false, cellStyles: false,
-        cellHTML: false, sheetStubs: false,
+        type:       'array',
+        dense:      true,
+        // FIX: cellText:true populates cell.w with formatted string
+        // raw:false alone would lose numeric precision; cellText gives us both
+        cellText:   true,
+        cellDates:  false,  // keep dates as serial numbers; cell.w gives formatted date
+        cellNF:     false,
+        cellStyles: false,
+        cellHTML:   false,
+        sheetStubs: false,
       });
 
       const multi = wb.SheetNames.length > 1;
@@ -67,69 +87,90 @@ async function doIndex(msg: any) {
           if (ws) ws['!data'] = null;
           continue;
         }
+
         const data   = ws['!data'] as any[][];
         const hdrRow = data[0] || [];
-        const hdrs: string[] = hdrRow.map((c: any) =>
-          c?.v != null ? String(c.v) : ''
-        );
-        if (!hdrs.length) { ws['!data'] = null; continue; }
 
-        if (!headers.length) {
-          for (const h of hdrs) headers.push(multi ? sName + '::' + h : h);
+        // Headers: use formatted text (cell.w) so header names are readable
+        const hdrs: string[] = hdrRow.map((c: any) => {
+          if (c == null) return '';
+          return c.w != null ? String(c.w) : (c.v != null ? String(c.v) : '');
+        });
+
+        if (!hdrs.every(h => h === '')) {
+          // Only set headers from first sheet with actual content
+          if (!headers.length) {
+            for (const h of hdrs) headers.push(multi ? sName + '::' + h : h);
+          }
         }
+        if (!headers.length) { ws['!data'] = null; continue; }
+
+        const nCols = hdrs.length;
 
         for (let r = 1; r < data.length; r++) {
           const src = data[r];
-          let f = '', cmp = '';
+          let searchStr = '';  // goes into flat[] — lowercased
+          let compStr   = '';  // goes into compact[] — display values
+
           if (src) {
-            for (let c = 0; c < hdrs.length; c++) {
+            for (let c = 0; c < nCols; c++) {
               const cell = src[c] as any;
-              const v = cell?.v != null ? String(cell.v) : '';
-              if (v !== '') f += v + ' ';
-              if (c) cmp += SEP;
-              cmp += v;
+              const { display, raw } = cellValues(cell);
+
+              // compact: use display value for showing to user
+              if (c > 0) compStr += SEP;
+              compStr += display;
+
+              // flat: add BOTH display and raw so either is searchable
+              if (display !== '') searchStr += display + ' ';
+              // Add raw only if different from display (e.g. date serial vs formatted)
+              if (raw !== '' && raw !== display) searchStr += raw + ' ';
             }
           }
-          flat.push(f.toLowerCase());
-          compact.push(cmp);
+
+          flat.push(searchStr.toLowerCase());
+          compact.push(compStr);
           sheets.push(sName);
           rowNums.push(r + 1);
         }
-        ws['!data'] = null;
+
+        ws['!data'] = null; // free memory immediately
       }
 
     } else if (type === 'csv') {
+
       const text = await blob.text();
       let first  = true;
       let rn     = 1;
+
       Papa.parse(text, {
         skipEmptyLines: true,
         step: (res: any) => {
           const row: string[] = res.data;
           if (first) {
-            for (const h of row) headers.push(String(h || ''));
+            for (const h of row) headers.push(String(h ?? '').trim());
             first = false;
             return;
           }
           rn++;
-          let f = '', cmp = '';
+          let searchStr = '', compStr = '';
           for (let i = 0; i < row.length; i++) {
-            const v = String(row[i] || '');
-            if (v !== '') f += v + ' ';
-            if (i) cmp += SEP;
-            cmp += v;
+            const v = String(row[i] ?? '').trim();
+            if (i > 0) compStr += SEP;
+            compStr   += v;
+            if (v !== '') searchStr += v + ' ';
           }
-          flat.push(f.toLowerCase());
-          compact.push(cmp);
+          flat.push(searchStr.toLowerCase());
+          compact.push(compStr);
           sheets.push(null);
           rowNums.push(rn);
         },
       });
 
     } else {
-      // TXT
+      // TXT — one line per row
       const text  = await blob.text();
-      const lines = text.split('\n');
+      const lines = text.split(/\r?\n/);
       headers.push('line');
       for (let i = 0; i < lines.length; i++) {
         const l = lines[i].trim();
@@ -142,80 +183,107 @@ async function doIndex(msg: any) {
     }
 
     if (!headers.length && flat.length) headers.push('col1');
+
     DB.set(id, { name, type, flat, compact, headers, sheets, rowNums });
     self.postMessage({ t: 'ok', id, n: flat.length });
 
   } catch (e: any) {
-    self.postMessage({ t: 'err', id, msg: String(e?.message || e) });
+    self.postMessage({ t: 'err', id, msg: String(e?.message ?? e) });
   }
 }
 
 // ── SEARCH ────────────────────────────────────────────────────────────────────
 function doSearch(msg: any) {
-  const { sid, id, q: rawQ, exact, fuzzy } = msg;
+  const { sid, id } = msg;
   const entry = DB.get(id);
+
   if (!entry || !entry.flat.length) {
     self.postMessage({ t: 'done', sid, id });
     return;
   }
 
   const { flat, headers: hdrs, sheets: shts, rowNums, name } = entry;
-  const q     = String(rawQ || '').toLowerCase().trim();
+
+  // Normalise query
+  const q     = String(msg.q ?? '').toLowerCase().trim();
+  const exact = !!msg.exact;
+  const fuzzy = !!msg.fuzzy;
   const terms = q ? q.split(/\s+/).filter(t => t.length > 0) : [];
   const empty = q === '';
 
-  // Priority preview columns
-  const PRIO = ['date','amount','debit','credit','balance','particular',
-                'narration','description','ref','name','utr','account','remarks'];
+  // Compute priority preview column indices once per file
+  const PRIO = [
+    'date','time','amount','debit','credit','balance',
+    'particular','narration','description','detail',
+    'ref','chq','cheque','utr','name','account','remarks','note',
+  ];
   const pi: number[] = [];
-  for (let hi = 0; hi < hdrs.length && pi.length < 4; hi++) {
+  for (let hi = 0; hi < hdrs.length && pi.length < 5; hi++) {
     const bare = hdrs[hi].toLowerCase().replace(/^[^:]+::/, '');
     if (PRIO.some(p => bare.includes(p))) pi.push(hi);
   }
-  if (!pi.length) for (let i = 0; i < Math.min(4, hdrs.length); i++) pi.push(i);
+  // Fallback: use first 4 columns
+  if (!pi.length) {
+    for (let i = 0; i < Math.min(4, hdrs.length); i++) pi.push(i);
+  }
 
   const hits: any[] = [];
-  const CHUNK = 300;
+  const CHUNK = 400;
 
   for (let ri = 0; ri < flat.length; ri++) {
     const f = flat[ri];
     let sc  = 0;
-    let cs: string[]|null = null;
+    let cs: string[] | null = null;
 
     if (empty) {
       sc = 1;
+
     } else if (exact) {
+      // Exact: any single cell equals query exactly (case-insensitive)
       cs = getCells(entry, ri);
-      for (const c of cs) if (c.toLowerCase() === q) { sc = 10; break; }
+      for (const c of cs) {
+        if (c.toLowerCase() === q) { sc = 10; break; }
+      }
+
     } else if (fuzzy) {
-      // Fuzzy: every term must appear somewhere in the row (substring match)
-      let ok = true, s = 0;
+      // Fuzzy: ALL terms must appear somewhere in the row (substring)
+      let ok = true;
+      let s  = 0;
       for (const t of terms) {
         const pos = f.indexOf(t);
         if (pos === -1) { ok = false; break; }
         s += pos === 0 ? 3 : 1;
       }
       if (ok) sc = s || 1;
+
     } else {
-      // Plain substring — the whole query string must appear
+      // Plain: entire query must appear as a substring
       const pos = f.indexOf(q);
       if (pos !== -1) sc = pos === 0 ? 3 : 1;
     }
 
     if (!sc) continue;
+
     if (!cs) cs = getCells(entry, ri);
 
+    // Build preview from priority columns
     const parts: string[] = [];
     for (const pj of pi) {
       const v = cs[pj];
-      if (v) parts.push(hdrs[pj].replace(/^[^:]+::/, '') + ': ' + v);
+      if (v && v.trim()) {
+        parts.push(hdrs[pj].replace(/^[^:]+::/, '') + ': ' + v);
+      }
     }
 
     hits.push({
-      id: id + '-' + ri, fid: id, fn: name,
-      sn: shts[ri], rn: rowNums[ri],
-      ss: parts.length ? parts.join(' | ') : (cs[0] || '').slice(0, 120),
-      sc, ri,
+      id:  id + '-' + ri,
+      fid: id,
+      fn:  name,
+      sn:  shts[ri],
+      rn:  rowNums[ri],
+      ss:  parts.length ? parts.join(' | ') : (cs[0] ?? '').slice(0, 140),
+      sc,
+      ri,
     });
 
     if (hits.length >= CHUNK) {
@@ -230,48 +298,60 @@ function doSearch(msg: any) {
 // ── ROW DETAIL ────────────────────────────────────────────────────────────────
 function doRow(msg: any) {
   const entry = DB.get(msg.id);
-  if (!entry) { self.postMessage({ t: 'row', id: msg.id, ri: msg.ri, d: null }); return; }
+  if (!entry) {
+    self.postMessage({ t: 'row', id: msg.id, ri: msg.ri, d: null });
+    return;
+  }
   const cs = getCells(entry, msg.ri);
-  if (!cs.length) { self.postMessage({ t: 'row', id: msg.id, ri: msg.ri, d: null }); return; }
-  const obj: Record<string,string> = {};
+  const obj: Record<string, string> = {};
   for (let i = 0; i < entry.headers.length; i++) {
-    obj[entry.headers[i].replace(/^[^:]+::/, '') || ('col' + i)] = cs[i] || '';
+    const k = entry.headers[i].replace(/^[^:]+::/, '') || ('col' + i);
+    obj[k] = cs[i] ?? '';
   }
   self.postMessage({ t: 'row', id: msg.id, ri: msg.ri, d: obj });
 }
 
 // ── EXPORT ────────────────────────────────────────────────────────────────────
 function doExport(msg: any) {
-  const hits = msg.hits || [];
+  const hits: any[] = msg.hits ?? [];
   if (!hits.length) {
     self.postMessage({ t: 'csv', blob: new Blob([''], { type: 'text/csv' }) });
     return;
   }
+
   const lines: string[]       = [];
   const byFile                = new Map<string, any[]>();
   for (const h of hits) {
     if (!byFile.has(h.fid)) byFile.set(h.fid, []);
     byFile.get(h.fid)!.push(h);
   }
+
   let wrote = false;
   for (const [fid, fhits] of byFile) {
     const e = DB.get(fid);
     if (!e) continue;
     const bh = e.headers.map(h => h.replace(/^[^:]+::/, ''));
     if (!wrote) {
-      lines.push(['File','Sheet','Row',...bh]
-        .map(x => '"' + String(x).replace(/"/g,'""') + '"').join(','));
+      lines.push(
+        ['File', 'Sheet', 'Row', ...bh]
+          .map(x => '"' + String(x).replace(/"/g, '""') + '"')
+          .join(',')
+      );
       wrote = true;
     }
     for (const m of fhits) {
       const cs = getCells(e, m.ri);
       lines.push([
-        '"' + e.name.replace(/"/g,'""') + '"',
-        '"' + (m.sn || '') + '"',
+        '"' + e.name.replace(/"/g, '""') + '"',
+        '"' + (m.sn ?? '') + '"',
         m.rn,
-        ...cs.map(v => '"' + String(v||'').replace(/"/g,'""') + '"'),
+        ...cs.map(v => '"' + String(v ?? '').replace(/"/g, '""') + '"'),
       ].join(','));
     }
   }
-  self.postMessage({ t: 'csv', blob: new Blob([lines.join('\n')], { type: 'text/csv' }) });
+
+  self.postMessage({
+    t: 'csv',
+    blob: new Blob([lines.join('\n')], { type: 'text/csv' }),
+  });
 }

@@ -115,10 +115,16 @@ export default function App() {
 
     function dispatchNext() {
       if (!iQueueRef.current.length) {
-        // Queue empty — check if ALL files are now indexed → show dialog
+        // Queue empty — all indexed. Show dialog then auto-search if query waiting.
         setFiles(prev => {
           const allDone = prev.length > 0 && prev.every(x => x.st === 'ok' || x.st === 'err');
-          if (allDone) setShowDialog(true);
+          if (allDone) {
+            setShowDialog(true);
+            // Auto-run search if user typed a query while indexing
+            if (queryRef.current.trim()) {
+              setTimeout(() => runSearch(queryRef.current), 50);
+            }
+          }
           return prev;
         });
         return;
@@ -385,12 +391,11 @@ export default function App() {
                 ? <Loader2 size={14} className="ll-spin" style={{color:'#f59e0b'}}/>
                 : <Search  size={14} style={{color:query?'#f59e0b':'#4a5568'}}/>}
             </span>
-            <input className="ll-input" value={query} disabled={!ready}
+            <input className="ll-input" value={query} style={{opacity: isIdx && !files.some(f=>f.st==="ok") ? 0.6 : 1}}
               autoComplete="off" spellCheck={false}
               placeholder={
-                isIdx  ? `Indexing ${nOk}/${files.length} files…` :
                 !files.length ? 'Open a folder to start searching' :
-                !ready ? 'Building index…' :
+                isIdx  ? `Indexing ${nOk}/${files.length}… type to search when ready` :
                 `Search ${fmtN(totRows)} rows across ${files.length} files`
               }
               onChange={e=>{setQuery(e.target.value);trigSearch(e.target.value);}}
