@@ -55,6 +55,7 @@ export default function App() {
   const [expD,       setExpD]       = useState<Record<string,string>|null>(null);
   const [expLoad,    setExpLoad]    = useState(false);
   const [hitCount,   setHitCount]   = useState(0);
+  const [showDialog, setShowDialog] = useState(false);  // post-index summary dialog
   const [scrollTop,  setScrollTop]  = useState(0);
   const [viewH,      setViewH]      = useState(600);
   const bodyRef = useRef<HTMLDivElement>(null);
@@ -113,7 +114,15 @@ export default function App() {
     }
 
     function dispatchNext() {
-      if (!iQueueRef.current.length) return;
+      if (!iQueueRef.current.length) {
+        // Queue empty — check if ALL files are now indexed → show dialog
+        setFiles(prev => {
+          const allDone = prev.length > 0 && prev.every(x => x.st === 'ok' || x.st === 'err');
+          if (allDone) setShowDialog(true);
+          return prev;
+        });
+        return;
+      }
       const f = iQueueRef.current.shift()!;
       setFiles(prev => prev.map(x => x.id===f.id ? {...x,st:'ing' as const} : x));
       w.postMessage({t:'idx', id:f.id, blob:f.blob, ft:f.type, name:f.name});
@@ -205,6 +214,7 @@ export default function App() {
     setExpId(null);     expIdRef.current = null;
     setExpD(null);
     setHitCount(0);
+    setShowDialog(false);
 
     const list: FM[] = [];
     for (let i = 0; i < raw.length; i++) {
@@ -314,6 +324,53 @@ export default function App() {
 
   return (
     <div className="ll-root">
+      {/* ── Post-index Dialog ── */}
+      {showDialog && (
+        <div className="ll-overlay" onClick={()=>setShowDialog(false)}>
+          <div className="ll-dialog" onClick={e=>e.stopPropagation()}>
+            <div className="ll-dialog-title">
+              <span style={{color:'#4ade80'}}>✓</span> INDEX READY
+            </div>
+            <div className="ll-dialog-stats">
+              <div className="ll-dstat">
+                <div className="ll-dstat-val">{files.filter(f=>f.st==='ok').length}</div>
+                <div className="ll-dstat-lbl">FILES</div>
+              </div>
+              <div className="ll-dstat">
+                <div className="ll-dstat-val">{fmtN(totRows)}</div>
+                <div className="ll-dstat-lbl">ROWS</div>
+              </div>
+              <div className="ll-dstat">
+                <div className="ll-dstat-val">{fmtB(files.reduce((s,f)=>s+f.size,0))}</div>
+                <div className="ll-dstat-lbl">SIZE</div>
+              </div>
+              {files.filter(f=>f.st==='err').length > 0 && (
+                <div className="ll-dstat">
+                  <div className="ll-dstat-val" style={{color:'#f87171'}}>{files.filter(f=>f.st==='err').length}</div>
+                  <div className="ll-dstat-lbl">ERRORS</div>
+                </div>
+              )}
+            </div>
+            <div className="ll-dialog-files">
+              {files.filter(f=>f.st==='ok').slice(0,8).map(f=>(
+                <div key={f.id} className="ll-dfile">
+                  <span className="ll-dfile-dot" style={{background: EXT[eOf(f.name) as Ext]?.c||'#38bdf8'}}/>
+                  <span className="ll-dfile-name">{f.name}</span>
+                  <span className="ll-dfile-rows">{fmtN(f.rows)} rows</span>
+                </div>
+              ))}
+              {files.filter(f=>f.st==='ok').length > 8 && (
+                <div style={{fontSize:9,color:'#4a5568',padding:'2px 0'}}>
+                  +{files.filter(f=>f.st==='ok').length-8} more files
+                </div>
+              )}
+            </div>
+            <button className="ll-dialog-btn" onClick={()=>setShowDialog(false)}>
+              START SEARCHING →
+            </button>
+          </div>
+        </div>
+      )}
       <header className="ll-header">
         <div className="ll-topbar">
 
@@ -675,6 +732,30 @@ const HitRow=memo(({h,open,data,loading,onOpen,q}:{
     ::-webkit-scrollbar-track{background:transparent}
     ::-webkit-scrollbar-thumb{background:var(--brd2);border-radius:4px}
     button,input{font-family:inherit}
+    /* Dialog */
+    .ll-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);
+      display:flex;align-items:center;justify-content:center;z-index:1000}
+    .ll-dialog{background:#0f1117;border:1px solid #252b3b;border-radius:12px;
+      padding:24px;min-width:320px;max-width:440px;width:90%;box-shadow:0 24px 64px rgba(0,0,0,.6)}
+    .ll-dialog-title{font-size:13px;font-weight:700;letter-spacing:.1em;color:#e2e8f0;
+      margin-bottom:20px;display:flex;align-items:center;gap:8px}
+    .ll-dialog-stats{display:flex;gap:12px;margin-bottom:20px}
+    .ll-dstat{flex:1;background:#141720;border:1px solid #1c2030;border-radius:8px;
+      padding:12px 8px;text-align:center}
+    .ll-dstat-val{font-size:18px;font-weight:700;color:#e2e8f0;margin-bottom:3px}
+    .ll-dstat-lbl{font-size:8px;color:#4a5568;letter-spacing:.1em;font-weight:600}
+    .ll-dialog-files{display:flex;flex-direction:column;gap:5px;margin-bottom:20px;
+      max-height:200px;overflow-y:auto}
+    .ll-dfile{display:flex;align-items:center;gap:8px;padding:5px 8px;
+      background:#141720;border-radius:5px;border:1px solid #1c2030}
+    .ll-dfile-dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+    .ll-dfile-name{flex:1;font-size:10px;color:#e2e8f0;overflow:hidden;
+      text-overflow:ellipsis;white-space:nowrap}
+    .ll-dfile-rows{font-size:9px;color:#4a5568;flex-shrink:0}
+    .ll-dialog-btn{width:100%;padding:10px;background:#f59e0b;border:none;border-radius:7px;
+      color:#0a0b0e;font-size:11px;font-weight:700;letter-spacing:.08em;cursor:pointer;
+      font-family:inherit;transition:box-shadow .15s}
+    .ll-dialog-btn:hover{box-shadow:0 0 20px rgba(245,158,11,.45)}
   `;
   document.head.appendChild(s);
 }
